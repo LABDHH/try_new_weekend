@@ -1,0 +1,19 @@
+node_modules/
+.next/
+out/
+build/
+next-env.d.ts
+
+# Secrets
+.env
+.env.local
+.env*.local
+
+# Recorded API responses can contain a lot of place data; keep them local.
+fixtures/*.json
+!fixtures/answers-*.json
+
+.DS_Store
+*.tsbuildinfo
+.vercel
+.idea/

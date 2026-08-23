@@ -1,0 +1,307 @@
+import { z } from "zod";
+
+/**
+ * OUTPUT FORMAT CONTRACT.
+ *
+ * One source of truth: this Zod schema both constrains generation (converted to
+ * JSON Schema for Gemini's structured output) and validates what comes back.
+ * They cannot drift apart, because they are the same object.
+ */
+
+export const stopSchema = z.object({
+  /**
+   * Must match an id from the supplied pool — EXCEPT for travel stops
+   * (depart / drive_home), which reference the traveller's own origin and use
+   * the sentinel "origin". Enforced in code, not by the prompt.
+   */
+  placeId: z.string().min(1).describe('Exact id from the supplied list, or "origin" for depart/drive_home stops.'),
+  name: z.string().min(1).max(300),
+  kind: z.enum([
+    "depart", "checkin", "breakfast", "coffee", "sight", "outdoor",
+    "lunch", "activity", "viewpoint", "shopping", "dinner", "evening", "dessert", "drive_home",
+  ]),
+  startTime: z.string().regex(/^\d{2}:\d{2}$/, "Expected HH:MM"),
+  endTime: z.string().regex(/^\d{2}:\d{2}$/, "Expected HH:MM"),
+  /** What this place is actually known for — the concrete draw, not adjectives. */
+  famousFor: z.string().min(5).max(600).describe("What this place is concretely known for. 1-2 sentences, under 400 characters."),
+  /** Must cite something the user actually answered. Graded, not just parsed. */
+  why: z.string().min(5).max(600).describe("Why this suits THIS traveller, citing something they said. Under 300 characters."),
+  /** How you get here from the previous stop: "10 min walk", "25 min drive". */
+  travelFromPrevious: z.string().max(160).optional().describe("How you get here from the previous stop, e.g. \"25 min drive\"."),
+  /** Practical friction-remover: "book ahead", "closed Mondays", "cash only". */
+  headsUp: z.string().max(400).optional().describe("Practical friction only: book ahead, closes early, cash only."),
+  /** True for the one unmissable thing each day. */
+  isHighlight: z.boolean(),
+  optional: z.boolean(),
+});
+
+export const alternateSchema = z.object({
+  placeId: z.string().min(1),
+  name: z.string().min(1),
+  /** Which stop this replaces, and in what circumstance. */
+  insteadOf: z.string().max(240).describe("The name of the stop this replaces."),
+  why: z.string().min(5).max(600).describe("When and why you would swap to this instead."),
+});
+
+export const daySchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  title: z.string().min(1).max(240).describe("Short title for the day, a few words."),
+  /** Two or three sentences setting up the shape of the day. */
+  narrative: z.string().min(20).max(1200).describe("2-3 sentences setting up the shape of the day."),
+  weatherNote: z.string().max(600).optional(),
+  stops: z.array(stopSchema).min(4).max(12).describe("6 to 9 stops covering the whole day, meals included."),
+  /** Swaps if something is closed, rained off, or not their thing. */
+  alternates: z.array(alternateSchema).max(6).describe("2-4 swaps if something is closed or rained off."),
+});
+
+export const itinerarySchema = z.object({
+  destinationName: z.string().min(1).max(200),
+  /** The one line that has to earn trust immediately. */
+  whyHere: z.string().min(15).max(900),
+  /** What the area is genuinely known for, in concrete terms. */
+  knownFor: z.string().min(15).max(900),
+  travelNote: z.string().max(900),
+  days: z.array(daySchema).min(1).max(4),
+  /** Practical prep: what to carry, book, or know before leaving. */
+  beforeYouGo: z.array(z.string().max(500)).max(8),
+  /** Honest limitations: sparse data, weather risk, compromises made. */
+  caveats: z.array(z.string().max(500)).max(8),
+});
+
+export type Itinerary = z.infer<typeof itinerarySchema>;
+export type ItineraryStop = z.infer<typeof stopSchema>;
+export type ItineraryAlternate = z.infer<typeof alternateSchema>;
+export type ItineraryDay = z.infer<typeof daySchema>;
+
+/** What Gemini returns at the shortlist stage. */
+/**
+ * The scoring step is not decoration. Requiring an explicit score per candidate
+ * BEFORE the pick forces the model to weigh every dimension rather than
+ * pattern-matching to whichever name it recognises. Same model, better answer.
+ */
+export const destinationScoreSchema = z.object({
+  name: z.string().min(1).max(160),
+  driveFit: z.number().min(0).max(10).describe("Does the real drive time hit the band they asked for? Undershooting scores low."),
+  interestFit: z.number().min(0).max(10).describe("How well it serves their stated interests and free text."),
+  varietyFit: z.number().min(0).max(10).describe("Does it support a full, varied trip rather than one activity?"),
+  weatherFit: z.number().min(0).max(10).describe("How workable the forecast is for these specific dates."),
+  groupFit: z.number().min(0).max(10).describe("Suitability for who is actually going."),
+  dataQuality: z.number().min(0).max(10).describe("Are there enough well-rated real places to build a plan?"),
+  total: z.number().min(0).max(60),
+  verdict: z.string().max(400),
+});
+
+export const shortlistSchema = z.object({
+  /** Every candidate scored before any is chosen. */
+  scores: z.array(destinationScoreSchema).min(1).max(6),
+  destinationName: z.string().min(1),
+  whyThisDestination: z.string().min(10).max(700),
+  /** Why the runners-up lost — keeps the comparison honest. */
+  whyNotOthers: z.string().max(600).optional(),
+  placeIds: z.array(z.string().min(1)).min(8).max(50),
+  /** Forces the balance requirement to be acknowledged, not assumed. */
+  balanceCheck: z
+    .string()
+    .max(400)
+    .describe("State how many experience places vs food places you selected, and confirm the mix is right."),
+});
+
+export type Shortlist = z.infer<typeof shortlistSchema>;
+export type DestinationScore = z.infer<typeof destinationScoreSchema>;
+
+export const ideationSchema = z.object({
+  /**
+   * Forces the model to state its read of the brief BEFORE naming anywhere.
+   * A conclusion reached after articulating the constraints is measurably
+   * better than one produced straight from a list of preferences.
+   */
+  brief: z
+    .string()
+    .min(30)
+    .max(900)
+    .describe("What this traveller actually needs, in 2-3 sentences, before you name anywhere."),
+  destinations: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(160),
+        region: z.string().max(160).optional(),
+        /** Their own estimate, checked later against a real traffic-aware route. */
+        estimatedDriveHours: z.number().min(0).max(24),
+        pitch: z.string().max(400),
+        /** How it serves what they specifically asked for. */
+        matchesInterests: z.string().max(500),
+        /** Distinct kinds of things to do — the all-round test. */
+        offers: z.array(z.string().max(120)).max(8),
+        /** Whether this time of year actually works there. */
+        seasonNote: z.string().max(400),
+        /** 1-5. Low means "plausible but I am not certain". */
+        confidence: z.number().min(1).max(5),
+      }),
+    )
+    .min(1)
+    .max(20),
+});
+
+export type Ideation = z.infer<typeof ideationSchema>;
+
+/**
+ * Gemini accepts only a subset of JSON Schema and rejects unknown keywords, so
+ * the generated schema is stripped before it is sent.
+ */
+export function toGeminiSchema(schema: z.ZodType): Record<string, unknown> {
+  const json = z.toJSONSchema(schema, { io: "output" }) as Record<string, unknown>;
+  return strip(json) as Record<string, unknown>;
+}
+
+/**
+ * Gemini accepts only a subset of JSON Schema. `minItems`/`maxItems` are
+ * deliberately absent: sending them returns 400 INVALID_ARGUMENT (verified
+ * against the live API). Nothing is lost — Zod still enforces those bounds when
+ * the response is parsed, and violations feed back through the repair loop with
+ * a clearer message than a schema rejection would give.
+ */
+const ALLOWED = new Set([
+  "type", "properties", "required", "items", "enum", "description",
+  "minimum", "maximum", "nullable", "format", "anyOf",
+]);
+
+function strip(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(strip);
+  if (node === null || typeof node !== "object") return node;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (!ALLOWED.has(key)) continue;
+    // `properties` keys are user-defined field names, not schema keywords —
+    // recurse into the values but never filter the keys themselves.
+    if (key === "properties" && value && typeof value === "object") {
+      const props: Record<string, unknown> = {};
+      for (const [pk, pv] of Object.entries(value as Record<string, unknown>)) {
+        props[pk] = strip(pv);
+      }
+      out[key] = props;
+    } else {
+      out[key] = strip(value);
+    }
+  }
+  return out;
+}
+
+
+/**
+ * Cosmetic overruns should not cost a user their entire itinerary.
+ *
+ * Gemini's schema subset carries no maxLength, so the model genuinely cannot
+ * see these limits — enforcing them by rejection means burning repair attempts
+ * on a sentence being twelve characters too long. Structural problems
+ * (invented places, wrong dates, impossible times) still fail loudly; only
+ * length is quietly clamped.
+ */
+
+/** Stops that reference the traveller's own origin rather than a pooled place. */
+export const TRAVEL_KINDS = new Set(["depart", "drive_home"]);
+
+/** Stops that make sense as the one thing a day is built around. */
+const HIGHLIGHT_KINDS = new Set(["sight", "outdoor", "activity", "viewpoint"]);
+
+/**
+ * A stay legitimately recurs — check in on arrival, check out on departure —
+ * so it is exempt from the duplicate rule, as are travel stops.
+ */
+export const REPEATABLE_KINDS = new Set(["checkin", "depart", "drive_home"]);
+
+const DEFAULT_MINUTES: Record<string, number> = {
+  depart: 60, drive_home: 90, checkin: 30, breakfast: 45, coffee: 40,
+  lunch: 60, dinner: 90, dessert: 30, sight: 75, outdoor: 120,
+  activity: 90, viewpoint: 45, shopping: 60, evening: 90,
+};
+
+function defaultMinutes(kind: string): number {
+  return DEFAULT_MINUTES[kind] ?? 60;
+}
+
+function addMinutes(hhmm: string, minutes: number): string {
+  const [h, m] = hhmm.split(":").map(Number);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return hhmm;
+  const total = Math.min(23 * 60 + 59, h * 60 + m + minutes);
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
+export function normalizeItinerary(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object") return raw;
+
+  const clamp = (v: unknown, max: number) =>
+    typeof v === "string" && v.length > max ? `${v.slice(0, max - 1).trimEnd()}…` : v;
+
+  const r = raw as Record<string, unknown>;
+
+  r.destinationName = clamp(r.destinationName, 200);
+  r.whyHere = clamp(r.whyHere, 900);
+  r.knownFor = clamp(r.knownFor, 900);
+  r.travelNote = clamp(r.travelNote, 900);
+
+  if (Array.isArray(r.beforeYouGo)) {
+    r.beforeYouGo = r.beforeYouGo.slice(0, 8).map((x) => clamp(x, 500));
+  }
+  if (Array.isArray(r.caveats)) {
+    r.caveats = r.caveats.slice(0, 8).map((x) => clamp(x, 500));
+  }
+
+  if (Array.isArray(r.days)) {
+    for (const day of r.days as Record<string, unknown>[]) {
+      day.title = clamp(day.title, 240);
+      day.narrative = clamp(day.narrative, 1200);
+      day.weatherNote = clamp(day.weatherNote, 600);
+
+      if (Array.isArray(day.alternates)) {
+        day.alternates = (day.alternates as Record<string, unknown>[]).slice(0, 6).map((a) => ({
+          ...a,
+          name: clamp(a.name, 300),
+          insteadOf: clamp(a.insteadOf, 240),
+          why: clamp(a.why, 600),
+        }));
+      }
+
+      if (Array.isArray(day.stops)) {
+        day.stops = (day.stops as Record<string, unknown>[]).slice(0, 12).map((st) => ({
+          ...st,
+          name: clamp(st.name, 300),
+          famousFor: clamp(st.famousFor, 600),
+          why: clamp(st.why, 600),
+          travelFromPrevious: clamp(st.travelFromPrevious, 160),
+          headsUp: clamp(st.headsUp, 400),
+          // Booleans are required by the schema but easy for a model to omit.
+          isHighlight: typeof st.isHighlight === "boolean" ? st.isHighlight : false,
+          optional: typeof st.optional === "boolean" ? st.optional : false,
+          // Travel stops have no pooled place; normalise them to the sentinel
+          // so they never look like an invented location.
+          placeId: TRAVEL_KINDS.has(String(st.kind)) ? "origin" : st.placeId,
+        }));
+
+        const stops = day.stops as Record<string, unknown>[];
+
+        // A stop that ends when it starts is malformed, not informative.
+        // Give it a duration appropriate to its kind rather than rejecting.
+        for (const st of stops) {
+          if (typeof st.startTime === "string" && typeof st.endTime === "string" && st.endTime <= st.startTime) {
+            st.endTime = addMinutes(st.startTime, defaultMinutes(String(st.kind)));
+          }
+        }
+
+        // Exactly one highlight per day. Models drop or double this routinely;
+        // picking one is a better outcome than failing the itinerary over it.
+        const highlights = stops.filter((st) => st.isHighlight === true);
+        if (highlights.length === 0) {
+          const candidate =
+            stops.find((st) => HIGHLIGHT_KINDS.has(String(st.kind))) ??
+            stops.find((st) => !TRAVEL_KINDS.has(String(st.kind)));
+          if (candidate) candidate.isHighlight = true;
+        } else if (highlights.length > 1) {
+          highlights.slice(1).forEach((st) => (st.isHighlight = false));
+        }
+      }
+    }
+  }
+
+  return r;
+}

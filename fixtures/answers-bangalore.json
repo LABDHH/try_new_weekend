@@ -1,0 +1,19 @@
+{
+  "origin": {
+    "name": "Bangalore, Karnataka, India",
+    "lat": 12.9716,
+    "lng": 77.5946
+  },
+  "departAt": "AUTO_NEXT_SATURDAY_07:00",
+  "returnBy": "AUTO_NEXT_SUNDAY_21:00",
+  "driveBucket": "h3_to_5",
+  "who": "couple",
+  "focus": [
+    "scenic",
+    "food",
+    "rustic"
+  ],
+  "budgetLevel": "comfortable",
+  "freeText": "no long hikes, we'd like somewhere green and quiet",
+  "focusText": ""
+}
