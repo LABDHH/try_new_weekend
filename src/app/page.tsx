@@ -65,6 +65,10 @@ export default function Home() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      // Tracks whether the server ever sent a terminal event. If the function
+      // is killed mid-stream (platform timeout, crash, dropped connection) the
+      // read loop simply ends, and without this the UI waits forever.
+      let terminated = false;
 
       for (;;) {
         const { done, value } = await reader.read();
@@ -83,8 +87,15 @@ export default function Home() {
           } catch {
             continue;
           }
+          if (event.type === "done" || event.type === "error") terminated = true;
           handleEvent(event);
         }
+      }
+
+      if (!terminated) {
+        throw new Error(
+          "The connection dropped before your itinerary was finished. This usually means it took too long — try again, or pick a shorter drive time.",
+        );
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong.");

@@ -7,6 +7,13 @@ import { toGeminiSchema } from "../schema/itinerary";
 
 let client: GoogleGenAI | null = null;
 
+/** Compose may run on a stronger model than the cheaper upstream stages. */
+function modelForStage(stage: string): string {
+  const e = env();
+  if (stage === "compose" && e.GEMINI_MODEL_COMPOSE) return e.GEMINI_MODEL_COMPOSE;
+  return e.GEMINI_MODEL;
+}
+
 function ai(): GoogleGenAI {
   if (!client) client = new GoogleGenAI({ apiKey: env().GEMINI_API_KEY });
   return client;
@@ -26,11 +33,18 @@ export type GenerateOptions<T> = {
    */
   normalize?: (raw: unknown) => unknown;
   /**
-   * Extra semantic checks beyond shape — e.g. "every placeId exists in the
-   * pool". Returning issues triggers a repair round rather than accepting
-   * output that parses but is wrong.
+   * Extra semantic checks beyond shape.
+   *
+   * Return a plain array to treat every issue as fatal, or split them:
+   *   hard — the output is unusable (invented places, wrong dates). Never accept.
+   *   soft — the output is usable but imperfect (balance, pacing). Worth a
+   *          repair attempt, but NOT worth failing the whole request over.
+   *
+   * The distinction matters because a user who waited 60 seconds should get an
+   * imperfect itinerary, not an error. Perfection here is the enemy of shipping
+   * anything at all.
    */
-  verify?: (value: T) => string[];
+  verify?: (value: T) => string[] | { hard?: string[]; soft?: string[] };
 };
 
 /**
@@ -62,7 +76,7 @@ export async function generateStructured<T>(opts: GenerateOptions<T>): Promise<T
     try {
       raw = await callWithTransientRetry(() =>
         ai().models.generateContent({
-          model: env().GEMINI_MODEL,
+          model: modelForStage(stage),
           contents: currentPrompt,
           config: {
             systemInstruction: system,
@@ -77,15 +91,29 @@ export async function generateStructured<T>(opts: GenerateOptions<T>): Promise<T
       throw toPlannerError(e);
     }
 
+    let softFallback: T | null = null;
+
     if (!raw.trim()) {
       lastIssues = ["Model returned an empty response"];
     } else {
       const parsed = parseAndValidate(raw, schema, verify, normalize);
       if (parsed.ok) return parsed.value;
       lastIssues = parsed.issues;
+      // Structurally sound, just imperfect — keep it as a fallback in case we
+      // run out of repair attempts.
+      if (parsed.usable) softFallback = parsed.usable;
     }
 
-    if (!budget.consumeRepair()) throw new ModelOutputError(lastIssues);
+    if (!budget.consumeRepair()) {
+      if (softFallback) {
+        console.warn(
+          `[gemini:${stage}] accepting imperfect output after exhausting repairs:`,
+          lastIssues.join("; "),
+        );
+        return softFallback;
+      }
+      throw new ModelOutputError(lastIssues);
+    }
 
     currentPrompt =
       `${prompt}\n\n` +
@@ -131,9 +159,9 @@ async function callWithTransientRetry(
 function parseAndValidate<T>(
   raw: string,
   schema: z.ZodType<T>,
-  verify?: (value: T) => string[],
+  verify?: (value: T) => string[] | { hard?: string[]; soft?: string[] },
   normalize?: (raw: unknown) => unknown,
-): { ok: true; value: T } | { ok: false; issues: string[] } {
+): { ok: true; value: T } | { ok: false; issues: string[]; usable?: T } {
   let json: unknown;
   try {
     json = JSON.parse(raw);
@@ -168,8 +196,18 @@ function parseAndValidate<T>(
     };
   }
 
-  const semantic = verify?.(result.data) ?? [];
-  if (semantic.length > 0) return { ok: false, issues: semantic.slice(0, 12) };
+  const checked = verify?.(result.data) ?? [];
+  const hard = Array.isArray(checked) ? checked : (checked.hard ?? []);
+  const soft = Array.isArray(checked) ? [] : (checked.soft ?? []);
+
+  if (hard.length > 0) {
+    // Genuinely unusable — never fall back to this.
+    return { ok: false, issues: [...hard, ...soft].slice(0, 12) };
+  }
+  if (soft.length > 0) {
+    // Worth one more try, but usable if we run out of attempts.
+    return { ok: false, issues: soft.slice(0, 12), usable: result.data };
+  }
 
   return { ok: true, value: result.data };
 }

@@ -6,8 +6,20 @@ import { answersSchema, driveBandFit, DRIVE_BUCKETS } from "../src/lib/schema/an
 import { sanitizeUserText, fence } from "../src/lib/gemini/sanitize";
 import { applyHygiene, confidenceScore } from "../src/lib/pipeline/hygiene";
 import { packPool } from "../src/lib/pipeline/pack";
-import { verifyItinerary } from "../src/lib/gemini/compose";
-import { normalizeItinerary } from "../src/lib/schema/itinerary";
+import { verifyItinerary as rawVerify } from "../src/lib/gemini/compose";
+
+/** All issues, hard and soft, flattened — most assertions only care that a
+ *  problem was detected at all. */
+const verifyItinerary = (
+  v: Parameters<typeof rawVerify>[0],
+  ids: Parameters<typeof rawVerify>[1],
+  d: Parameters<typeof rawVerify>[2],
+  foodFocused?: boolean,
+): string[] => {
+  const r = rawVerify(v, ids, d, foodFocused);
+  return [...r.hard, ...r.soft];
+};
+import { normalizeItinerary, coerceTime } from "../src/lib/schema/itinerary";
 import { Budget } from "../src/lib/budget";
 import { BUDGET } from "../src/lib/limits";
 import { haversineKm, boundingBox } from "../src/lib/geo";
@@ -408,6 +420,101 @@ const longText = normalizeItinerary(structuredClone({
 check("over-long famousFor trimmed", longText.days[0].stops[0].famousFor.length <= 600,
   String(longText.days[0].stops[0].famousFor.length));
 check("normalized itinerary still passes schema", itinerarySchema.safeParse(longText).success);
+
+
+// --- Hard vs soft: a slow request must never end in nothing ----------------
+section("Graceful degradation");
+
+const invented2 = structuredClone(goodItinerary);
+invented2.days[0].stops[0].placeId = "MADE_UP";
+const inventedSplit = rawVerify(invented2, validIds, dates);
+check("invented place is HARD (never shippable)",
+  inventedSplit.hard.some((i) => i.includes("not in the supplied list")));
+
+const foodTour2 = structuredClone(goodItinerary);
+foodTour2.days[0].stops = foodTour2.days[0].stops.map((st, i) => ({
+  ...st, kind: (["breakfast","coffee","lunch","dessert","dinner"] as const)[i], isHighlight: i === 4,
+}));
+const foodSplit = rawVerify(foodTour2, validIds, dates);
+check("food-heavy day is SOFT (imperfect but shippable)",
+  foodSplit.soft.length > 0 && foodSplit.hard.length === 0,
+  `hard=${JSON.stringify(foodSplit.hard)}`);
+
+const badDate2 = structuredClone(goodItinerary);
+badDate2.days[0].date = "2027-01-01";
+check("wrong date is HARD", rawVerify(badDate2, validIds, dates).hard.some((i) => i.includes("not part of the trip")));
+
+const overlap2 = structuredClone(goodItinerary);
+overlap2.days[0].stops[1].startTime = "09:15";
+check("overlapping times are HARD", rawVerify(overlap2, validIds, dates).hard.some((i) => i.includes("before")));
+
+check("clean itinerary has neither hard nor soft issues",
+  rawVerify(goodItinerary, validIds, dates).hard.length === 0 &&
+  rawVerify(goodItinerary, validIds, dates).soft.length === 0);
+
+
+// --- Time formats: the live "Expected HH:MM" failure -----------------------
+section("Time coercion (live failure mode)");
+
+const timeCases: Array<[string, string]> = [
+  ["09:00", "09:00"],
+  ["9:00", "09:00"],
+  ["9:00 AM", "09:00"],
+  ["9:00am", "09:00"],
+  ["1:30 PM", "13:30"],
+  ["1:30pm", "13:30"],
+  ["12:00 AM", "00:00"],
+  ["12:30 PM", "12:30"],
+  ["9.00", "09:00"],
+  ["0900", "09:00"],
+  ["1430", "14:30"],
+  ["7", "07:00"],
+  ["7pm", "19:00"],
+  ["2026-09-05T09:30:00", "09:30"],
+];
+for (const [input, expected] of timeCases) {
+  check(`coerceTime("${input}") -> ${expected}`, coerceTime(input) === expected, `got ${coerceTime(input)}`);
+}
+check("coerceTime rejects junk", coerceTime("sometime later") === undefined);
+check("coerceTime rejects empty", coerceTime("") === undefined);
+
+// The exact live failure: every stop time in a non-HH:MM format.
+const badTimes = normalizeItinerary(structuredClone({
+  ...goodItinerary,
+  days: [
+    {
+      ...goodItinerary.days[0],
+      stops: goodItinerary.days[0].stops.map((st, i) => ({
+        ...st,
+        startTime: `${8 + i}:00 AM`,
+        endTime: `${9 + i}:00 AM`,
+      })),
+    },
+    goodItinerary.days[1],
+  ],
+})) as Itinerary;
+check("12-hour times across a whole day are coerced",
+  itinerarySchema.safeParse(badTimes).success,
+  JSON.stringify(itinerarySchema.safeParse(badTimes).success ? "" : badTimes.days[0].stops.map((s) => s.startTime)));
+
+// Overlaps are repaired, not rejected.
+const overlapping = normalizeItinerary(structuredClone({
+  ...goodItinerary,
+  days: [
+    {
+      ...goodItinerary.days[0],
+      stops: goodItinerary.days[0].stops.map((st) => ({ ...st, startTime: "10:00", endTime: "12:00" })),
+    },
+    goodItinerary.days[1],
+  ],
+})) as Itinerary;
+const seq = overlapping.days[0].stops;
+check("overlapping stops rescheduled in sequence",
+  seq.every((st, i) => i === 0 || st.startTime >= seq[i - 1].endTime),
+  seq.map((st) => `${st.startTime}-${st.endTime}`).join(" "));
+check("repaired schedule passes verification",
+  rawVerify(overlapping, validIds, dates).hard.length === 0,
+  JSON.stringify(rawVerify(overlapping, validIds, dates).hard));
 
 // --------------------------------------------------------------- BUDGET
 section("Budget / iteration ceilings");

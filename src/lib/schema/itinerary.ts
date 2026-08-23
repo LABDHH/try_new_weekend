@@ -27,7 +27,7 @@ export const stopSchema = z.object({
   /** Must cite something the user actually answered. Graded, not just parsed. */
   why: z.string().min(5).max(600).describe("Why this suits THIS traveller, citing something they said. Under 300 characters."),
   /** How you get here from the previous stop: "10 min walk", "25 min drive". */
-  travelFromPrevious: z.string().max(160).optional().describe("How you get here from the previous stop, e.g. \"25 min drive\"."),
+  travelFromPrevious: z.string().max(160).optional().describe("Leave this out — it is computed from real coordinates."),
   /** Practical friction-remover: "book ahead", "closed Mondays", "cash only". */
   headsUp: z.string().max(400).optional().describe("Practical friction only: book ahead, closes early, cash only."),
   /** True for the one unmissable thing each day. */
@@ -220,6 +220,62 @@ function defaultMinutes(kind: string): number {
   return DEFAULT_MINUTES[kind] ?? 60;
 }
 
+/**
+ * Accepts the many shapes a model produces for a clock time and returns HH:MM.
+ *
+ * Handles "9:00", "09:00", "9:00 AM", "9.00pm", "0900", bare "9", and full
+ * ISO timestamps. Returns undefined only when there is genuinely no time in
+ * the value.
+ */
+export function coerceTime(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const raw = value.trim();
+  if (!raw) return undefined;
+
+  const pad = (h: number, m: number) =>
+    `${String(Math.max(0, Math.min(23, h))).padStart(2, "0")}:${String(Math.max(0, Math.min(59, m))).padStart(2, "0")}`;
+
+  // ISO timestamp: take the clock portion.
+  const isoMatch = /T(\d{1,2}):(\d{2})/.exec(raw);
+  if (isoMatch) return pad(Number(isoMatch[1]), Number(isoMatch[2]));
+
+  const meridiem = /(a\.?m\.?|p\.?m\.?)/i.exec(raw);
+  const isPm = meridiem ? /^p/i.test(meridiem[1]) : false;
+  const isAm = meridiem ? /^a/i.test(meridiem[1]) : false;
+
+  // "9:00", "9.00", "9 00", "09:5"
+  const hm = /(\d{1,2})\s*[:.\s]\s*(\d{1,2})/.exec(raw);
+  if (hm) {
+    let hour = Number(hm[1]);
+    const minute = Number(hm[2]);
+    if (isPm && hour < 12) hour += 12;
+    if (isAm && hour === 12) hour = 0;
+    return pad(hour, minute);
+  }
+
+  // "0900" / "1430"
+  const compact = /^(\d{2})(\d{2})$/.exec(raw);
+  if (compact) return pad(Number(compact[1]), Number(compact[2]));
+
+  // Bare hour: "9", "9pm"
+  const bare = /^(\d{1,2})/.exec(raw);
+  if (bare) {
+    let hour = Number(bare[1]);
+    if (isPm && hour < 12) hour += 12;
+    if (isAm && hour === 12) hour = 0;
+    return pad(hour, 0);
+  }
+
+  return undefined;
+}
+
+function minutesBetween(start: string, end: string): number {
+  const [sh, sm] = start.split(":").map(Number);
+  const [eh, em] = end.split(":").map(Number);
+  if (![sh, sm, eh, em].every(Number.isFinite)) return 0;
+  return eh * 60 + em - (sh * 60 + sm);
+}
+
 function addMinutes(hhmm: string, minutes: number): string {
   const [h, m] = hhmm.split(":").map(Number);
   if (!Number.isFinite(h) || !Number.isFinite(m)) return hhmm;
@@ -280,12 +336,36 @@ export function normalizeItinerary(raw: unknown): unknown {
 
         const stops = day.stops as Record<string, unknown>[];
 
-        // A stop that ends when it starts is malformed, not informative.
-        // Give it a duration appropriate to its kind rather than rejecting.
+        // Times arrive in whatever format the model felt like. Flash-Lite
+        // routinely emits "9:00 AM" or "9:00" where the schema wants "09:00",
+        // and rejecting an otherwise good itinerary over a leading zero is
+        // indefensible. Coerce first, then repair the schedule.
         for (const st of stops) {
-          if (typeof st.startTime === "string" && typeof st.endTime === "string" && st.endTime <= st.startTime) {
-            st.endTime = addMinutes(st.startTime, defaultMinutes(String(st.kind)));
+          st.startTime = coerceTime(st.startTime) ?? "09:00";
+          st.endTime = coerceTime(st.endTime) ?? "10:00";
+        }
+
+        // Time arithmetic across a dozen stops is exactly what a small model
+        // gets wrong, and exactly what code gets right. Repair the schedule
+        // rather than rejecting an otherwise good itinerary over it.
+        let previousEnd: string | null = null;
+        for (const st of stops) {
+          let start = st.startTime as string;
+          let end = st.endTime as string;
+
+          // A stop cannot begin before the previous one finished.
+          if (previousEnd && start < previousEnd) {
+            const duration = minutesBetween(start, end);
+            start = previousEnd;
+            end = addMinutes(previousEnd, duration > 0 ? duration : defaultMinutes(String(st.kind)));
           }
+
+          // A stop that ends when it starts is malformed, not informative.
+          if (end <= start) end = addMinutes(start, defaultMinutes(String(st.kind)));
+
+          st.startTime = start;
+          st.endTime = end;
+          previousEnd = end;
         }
 
         // Exactly one highlight per day. Models drop or double this routinely;

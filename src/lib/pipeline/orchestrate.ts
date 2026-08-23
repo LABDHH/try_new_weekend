@@ -161,15 +161,16 @@ export async function planTrip(answers: Answers, emit: Emit): Promise<PlanResult
 
   // ---- 4. Place pool (search centred on each DESTINATION, not the origin) --
   emit({ type: "stage", stage: "places", message: "Finding places worth your time..." });
-  const rawPool: PoolPlace[] = [];
-  for (const dest of shortlisted) {
-    // CORE categories only at this stage. The destination decision needs a
-    // comparable picture of each candidate, not an exhaustive one.
-    const results = await Promise.all(
-      CORE_CATEGORIES.map((c) => searchNearby(dest, c.key, budget).catch(() => [])),
-    );
-    for (const list of results) rawPool.push(...list);
-  }
+  // CORE categories only at this stage: the destination decision needs a
+  // comparable picture of each candidate, not an exhaustive one.
+  //
+  // Every destination x category pair fires at once. Iterating destinations
+  // sequentially meant three round-trips where one would do — barely visible
+  // locally, but painful from a function region far from the API.
+  const searches = shortlisted.flatMap((dest) =>
+    CORE_CATEGORIES.map((c) => searchNearby(dest, c.key, budget).catch(() => [])),
+  );
+  const rawPool: PoolPlace[] = (await Promise.all(searches)).flat();
 
   const { kept, dropped } = applyHygiene(rawPool);
   if (kept.length < 5) {

@@ -73,6 +73,17 @@ export async function POST(req: NextRequest) {
         }
       };
 
+      // A comment frame every 15s. Ignored by the client parser, but it keeps
+      // intermediaries from treating a long quiet stage as a dead connection.
+      const heartbeat = setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(": keepalive\n\n"));
+        } catch {
+          closed = true;
+        }
+      }, 15_000);
+
       try {
         const key = cacheKey(answers);
 
@@ -102,6 +113,7 @@ export async function POST(req: NextRequest) {
         console.error("[plan] failed:", err.kind, err.message);
         send({ type: "error", kind: err.kind, message: err.userMessage });
       } finally {
+        clearInterval(heartbeat);
         closed = true;
         try {
           controller.close();

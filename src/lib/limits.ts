@@ -29,16 +29,20 @@ export const LIMITS = {
   DESTINATION_SEARCH_RADIUS_M: 25_000,
 
   /** Places sent to Gemini for shortlisting. Beyond this, Flash reasoning degrades. */
-  MAX_POOL_FOR_SHORTLIST: 300,
+  MAX_POOL_FOR_SHORTLIST: 200,
 
-  /** Finalists we fetch reviews for. Enough to build a full day with alternates. */
-  MAX_SHORTLIST: 42,
+  /**
+   * Finalists we fetch reviews for. Sized for a SMALL model: enough to build a
+   * full day with alternates, few enough that the compose payload stays inside
+   * the range where Flash-Lite reasons reliably.
+   */
+  MAX_SHORTLIST: 28,
 
   /** Reviews per place in the compose payload. More than this is noise, not signal. */
-  MAX_REVIEWS_PER_PLACE: 3,
+  MAX_REVIEWS_PER_PLACE: 2,
 
   /** Individual review text is truncated to this before reaching the model. */
-  MAX_REVIEW_CHARS: 320,
+  MAX_REVIEW_CHARS: 220,
 
   /** Free-text answer cap. Guards both context budget and injection surface. */
   MAX_FREETEXT_CHARS: 400,
@@ -62,7 +66,13 @@ export const BUDGET = {
   MAX_GEMINI_CALLS: 6, // 3 planned + up to 3 repair retries
   MAX_MAPS_CALLS: 90, // 13 geocode + 1 matrix + 3 weather + 15 core places + 4 extra places + 42 details, with headroom
   MAX_REPAIR_ATTEMPTS: 3, // structured-output repair loops before giving up
-  WALL_CLOCK_MS: 120_000, // whole pipeline deadline
+  /**
+   * Whole-pipeline deadline. Deliberately BELOW the platform's maxDuration
+   * (120s on the plan route): if these are equal, the function is killed
+   * mid-stream and the browser never receives a terminal event — it just
+   * hangs. The gap is the room needed to fail gracefully.
+   */
+  WALL_CLOCK_MS: 95_000,
   SINGLE_CALL_TIMEOUT_MS: 20_000,
   MAX_OUTPUT_TOKENS: 32_000,
 } as const;

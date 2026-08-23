@@ -19,6 +19,15 @@ const envSchema = z.object({
   // behaviour underneath prompts that were tuned against a specific version.
   GEMINI_MODEL: z.string().default("gemini-3.5-flash-lite"),
 
+  /**
+   * Compose is by far the hardest stage — a large structured document under
+   * many simultaneous constraints — and it is where a small model most often
+   * fails. Overriding just this stage costs one call per trip while leaving
+   * the cheap stages on the light model.
+   * Falls back to GEMINI_MODEL when unset.
+   */
+  GEMINI_MODEL_COMPOSE: z.string().optional(),
+
   // Supabase is Phase 5 and entirely optional. Blank => persistence disabled,
   // itineraries are returned inline instead of via a share link.
   SUPABASE_URL: z.string().url().optional().or(z.literal("")),

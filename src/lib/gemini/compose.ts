@@ -12,6 +12,7 @@ import {
 import { generateStructured } from "./client";
 import { BALANCE_RULES, renderProfile, VOICE_RULES } from "./profile";
 import { fence, sanitizeReview } from "./sanitize";
+import { haversineKm } from "../geo";
 
 const SYSTEM = `
 You are an experienced local guide who plans weekends that people actually
@@ -65,8 +66,8 @@ Every stop needs a start and end time that a human could actually keep.
 - Meals: breakfast 45-60min, lunch 60-75min, dinner 75-105min.
 - A museum or fort: 60-120min. A waterfall: 45-90min. A viewpoint: 30-45min.
 - A serious hike: 2-4 hours. Do not pretend it is one.
-- ALWAYS leave travel time between stops and state it in travelFromPrevious.
-  Nothing is instantaneous.
+- ALWAYS leave a realistic gap between stops. Nothing is instantaneous. You do
+  not need to write travelFromPrevious — that is calculated for you.
 - Check every time against that place's opening hours. Scheduling dinner
   somewhere that closes at 18:00 destroys trust in the whole plan.
 
@@ -147,14 +148,29 @@ export async function composeItinerary(
   whyThisDestination: string,
   budget: Budget,
 ): Promise<Itinerary> {
-  const validIds = new Set(places.map((p) => p.id));
   const dates = tripDates(answers);
+
+  /**
+   * Places are referenced by SHORT INDEX ("12"), not by Google place id
+   * ("ChIJN1t_tDeuEmsRUsoyG83frY4").
+   *
+   * A small model transcribing sixteen opaque 27-character strings exactly is
+   * the single most likely way this stage fails — and every slip looks like an
+   * "invented place". Two-digit refs are almost impossible to get wrong, and
+   * the real ids are restored from this map in code afterwards.
+   */
+  const refMap = new Map<string, EnrichedPlace>();
+  places.forEach((p, i) => refMap.set(String(i + 1), p));
+  const validIds = new Set(refMap.keys());
 
   // If they actually asked for a food trip, the balance rule must not override
   // them — it exists to stop drift, not to overrule a stated preference.
   const foodFocused =
     answers.focus.includes("food") ||
     /food|eat|cuisine|restaurant|culinary|foodie/i.test(answers.focusText ?? "");
+
+  const refOf = new Map<string, string>();
+  for (const [ref, p] of refMap) refOf.set(p.id, ref);
 
   const byCategory = new Map<string, EnrichedPlace[]>();
   for (const p of places) {
@@ -170,8 +186,8 @@ export async function composeItinerary(
       const entries = list
         .map((p) => {
           const lines = [
-            `### ${p.id}`,
-            `name: ${p.name}`,
+            `### [${refOf.get(p.id)}] ${p.name}`,
+            `reference number: ${refOf.get(p.id)}`,
             p.address ? `address: ${p.address}` : null,
             p.rating ? `rating: ${p.rating}/5 from ${p.ratingCount ?? 0} ratings` : "rating: none",
             p.sparseData ? `WARNING: very few ratings — flag uncertainty if you use this` : null,
@@ -232,6 +248,9 @@ Why it was chosen: ${whyThisDestination}
 ${weatherBlock}
 
 ## The ONLY places you may use, grouped by category
+
+Each place has a REFERENCE NUMBER in square brackets. Use that number as
+placeId — just the number, e.g. "7". Never write a name or an address there.
 ${placeBlocks}
 
 ## Build the itinerary
@@ -249,16 +268,65 @@ ${placeBlocks}
 ${VOICE_RULES}
 `.trim();
 
-  return generateStructured({
+  const draft = await generateStructured({
     stage: "compose",
     system: SYSTEM,
     prompt,
     schema: itinerarySchema,
     budget,
-    temperature: 0.7,
+    // Lower than before: this stage runs on a small model and structural
+    // reliability matters far more here than phrasing variety.
+    temperature: 0.4,
     normalize: normalizeItinerary,
     verify: (v) => verifyItinerary(v, validIds, dates, foodFocused),
   });
+
+  return hydrateRefs(draft, refMap);
+}
+
+/**
+ * Swaps short refs back for real Google place ids, and takes the authoritative
+ * name and travel time from the data rather than from the model.
+ */
+function hydrateRefs(itinerary: Itinerary, refMap: Map<string, EnrichedPlace>): Itinerary {
+  const hydrateStop = (stop: Itinerary["days"][0]["stops"][0]) => {
+    if (TRAVEL_KINDS.has(stop.kind)) return stop;
+    const place = refMap.get(stop.placeId);
+    if (!place) return stop;
+    return { ...stop, placeId: place.id, name: place.name };
+  };
+
+  return {
+    ...itinerary,
+    days: itinerary.days.map((day) => {
+      const stops = day.stops.map(hydrateStop);
+
+      // Travel time between stops is arithmetic, not judgment. Computing it
+      // from real coordinates is both more accurate than a model guess and one
+      // less field the model has to get right.
+      const withTravel = stops.map((stop, i) => {
+        if (i === 0 || TRAVEL_KINDS.has(stop.kind)) return stop;
+        const prev = refMap.get(day.stops[i - 1].placeId) ?? null;
+        const here = refMap.get(day.stops[i].placeId) ?? null;
+        if (!prev || !here) return stop;
+        const km = haversineKm(prev, here);
+        if (km < 0.4) return { ...stop, travelFromPrevious: "a short walk" };
+        const mins = Math.max(5, Math.round((km / 32) * 60));
+        return { ...stop, travelFromPrevious: `about ${mins} min (${km.toFixed(1)} km)` };
+      });
+
+      return {
+        ...day,
+        stops: withTravel,
+        alternates: day.alternates
+          .map((a) => {
+            const place = refMap.get(a.placeId);
+            return place ? { ...a, placeId: place.id, name: place.name } : a;
+          })
+          .filter((a) => a.placeId),
+      };
+    }),
+  };
 }
 
 /**
@@ -272,8 +340,13 @@ function verifyItinerary(
   validIds: Set<string>,
   dates: string[],
   foodFocused = false,
-): string[] {
+): { hard: string[]; soft: string[] } {
+  // HARD  — the itinerary is wrong and must never be shown: invented places,
+  //         dates outside the trip, impossible times.
+  // SOFT  — the itinerary is usable but not ideal: balance, pacing, thin days.
+  //         Worth a repair attempt; never worth showing the user an error.
   const issues: string[] = [];
+  const soft: string[] = [];
 
   const allStops = v.days.flatMap((d) => d.stops);
 
@@ -308,11 +381,11 @@ function verifyItinerary(
   v.days.forEach((day, i) => {
     const highlights = day.stops.filter((s) => s.isHighlight).length;
     if (highlights !== 1) {
-      issues.push(`Day ${i + 1} (${day.date}) has ${highlights} stops marked isHighlight. Every day needs exactly one.`);
+      soft.push(`Day ${i + 1} (${day.date}) has ${highlights} stops marked isHighlight. Every day needs exactly one.`);
     }
 
     if (day.stops.length < 5) {
-      issues.push(
+      soft.push(
         `Day ${i + 1} only has ${day.stops.length} stops. Build a full day of 6-9 stops including meals — you have plenty of real places to work with.`,
       );
     }
@@ -333,7 +406,7 @@ function verifyItinerary(
     const mealKinds = new Set(["breakfast", "lunch", "dinner", "coffee", "dessert"]);
     const foodStops = day.stops.filter((s) => mealKinds.has(s.kind)).length;
     if (day.stops.length >= 5 && foodStops === 0) {
-      issues.push(`Day ${i + 1} has no meals or food stops. People eat.`);
+      soft.push(`Day ${i + 1} has no meals or food stops. People eat.`);
     }
 
     // The opposite failure, and by far the more common one: restaurants
@@ -342,13 +415,13 @@ function verifyItinerary(
     const experiences = day.stops.filter((s) => experienceKinds.has(s.kind)).length;
 
     if (day.stops.length >= 5 && foodStops > Math.ceil(day.stops.length * 0.45)) {
-      issues.push(
+      soft.push(
         `Day ${i + 1} is ${foodStops} food stops out of ${day.stops.length} — that is a food tour, not a weekend. Replace some with sights, outdoor stops or activities.`,
       );
     }
 
     if (day.stops.length >= 5 && experiences < 2) {
-      issues.push(
+      soft.push(
         `Day ${i + 1} only has ${experiences} experience stop(s). Every day needs at least two things to see or do beyond eating.`,
       );
     }
@@ -361,7 +434,7 @@ function verifyItinerary(
       .map((d) => d.stops.find((st) => st.isHighlight))
       .filter((st) => st && foodKinds.has(st.kind));
     if (foodHighlights.length === v.days.length) {
-      issues.push(
+      soft.push(
         `Every day's highlight is a meal. Unless the trip is explicitly about food, the highlight should be something to see or do.`,
       );
     }
@@ -373,13 +446,13 @@ function verifyItinerary(
   for (const stop of allStops) {
     if (REPEATABLE_KINDS.has(stop.kind) || TRAVEL_KINDS.has(stop.kind)) continue;
     if (seen.has(stop.placeId)) {
-      issues.push(`"${stop.name}" appears more than once. Each place should appear at most once.`);
+      soft.push(`"${stop.name}" appears more than once. Each place should appear at most once.`);
       break;
     }
     seen.add(stop.placeId);
   }
 
-  return issues;
+  return { hard: issues, soft };
 }
 
 export { verifyItinerary };
