@@ -10,7 +10,8 @@ import {
 } from "@/lib/schema/answers";
 import { QuestionShell } from "./QuestionShell";
 import { ProgressBar } from "./ProgressBar";
-import { Chip, CityField, DateTimeField, OptionButton, TextArea, TextField, type CityChoice } from "./Inputs";
+import { Chip, CityField, OptionButton, TextArea, TextField, type CityChoice } from "./Inputs";
+import { DateTimePicker } from "./DateTimePicker";
 import { INTENT_COLOR } from "@/lib/intent";
 
 export type DraftAnswers = {
@@ -123,10 +124,11 @@ export function PlannerFlow({ onSubmit }: { onSubmit: (a: DraftAnswers) => void 
         onNext: next,
         onBack: back,
         children: (
-          <DateTimeField
+          <DateTimePicker
             value={a.departAt}
             min={localInputValue(new Date())}
             onChange={(v) => set("departAt", v)}
+            label="Departure date and time"
           />
         ),
       });
@@ -142,7 +144,12 @@ export function PlannerFlow({ onSubmit }: { onSubmit: (a: DraftAnswers) => void 
         onNext: next,
         onBack: back,
         children: (
-          <DateTimeField value={a.returnBy} min={a.departAt} onChange={(v) => set("returnBy", v)} />
+          <DateTimePicker
+            value={a.returnBy}
+            min={a.departAt}
+            onChange={(v) => set("returnBy", v)}
+            label="Return date and time"
+          />
         ),
       });
 

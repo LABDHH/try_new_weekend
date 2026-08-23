@@ -264,24 +264,3 @@ export function CityField({
     </div>
   );
 }
-
-/** datetime-local, rendered in the browser's timezone — i.e. the traveller's. */
-export function DateTimeField({
-  value,
-  onChange,
-  min,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  min?: string;
-}) {
-  return (
-    <input
-      type="datetime-local"
-      value={value}
-      min={min}
-      onChange={(e) => onChange(e.target.value)}
-      className="w-full border-b border-slate-400/30 bg-transparent pb-3 font-display text-3xl text-slate-50 outline-none transition-colors [color-scheme:dark] focus:border-amber-400"
-    />
-  );
-}
