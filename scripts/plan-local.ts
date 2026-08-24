@@ -83,7 +83,7 @@ async function main() {
         const tag = s.isHighlight ? "*" : s.optional ? "~" : " ";
         console.log(`   ${tag} ${s.startTime}-${s.endTime}  ${s.name}  [${s.kind}]`);
         console.log(`       famous for: ${s.famousFor}`);
-        console.log(`       why: ${s.why}`);
+        console.log(`       detail: ${s.detail}`);
         if (s.travelFromPrevious) console.log(`       getting there: ${s.travelFromPrevious}`);
         if (s.headsUp) console.log(`       heads up: ${s.headsUp}`);
       }

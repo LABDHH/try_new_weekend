@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { LIMITS } from "../limits";
+import { addDays, daysBetween, isValidTimeZone, zonedDate } from "../time";
 
 /**
  * INPUT GUARDRAIL.
@@ -69,6 +70,23 @@ export const answersSchema = z
       Object.keys(BUDGET_LEVEL) as [keyof typeof BUDGET_LEVEL, ...(keyof typeof BUDGET_LEVEL)[]],
     ),
     freeText: z.string().max(LIMITS.MAX_FREETEXT_CHARS).optional().default(""),
+    /**
+     * The traveller's IANA zone, from the browser.
+     *
+     * departAt/returnBy are UTC instants and this server runs in UTC, so
+     * without this every wall-clock reading is the server's, not theirs — a
+     * 05:00 Saturday departure from Bangalore reads back as Friday 23:30.
+     *
+     * Defaulted rather than required so an older cached client bundle degrades
+     * to today's behaviour instead of a hard 400; the warning at the API
+     * boundary is what makes that visible.
+     */
+    timeZone: z
+      .string()
+      .max(64)
+      .refine(isValidTimeZone, "Unrecognised timezone")
+      .optional()
+      .default("UTC"),
   })
   .superRefine((v, ctx) => {
     if (v.focus.length === 0 && !v.focusText?.trim()) {
@@ -127,26 +145,22 @@ export const answersSchema = z
 
 export type Answers = z.infer<typeof answersSchema>;
 
-/** Nights away, used for itinerary day count and hotel decisions. */
+/**
+ * Nights away, used for itinerary day count and hotel decisions.
+ *
+ * Counted in the TRAVELLER'S zone. Read in UTC on a Vercel box, a Saturday
+ * 05:00 IST departure falls on the Friday and yields an extra day.
+ */
 export function tripDays(a: Answers): number {
-  const depart = new Date(a.departAt);
-  const back = new Date(a.returnBy);
-  const startDay = new Date(depart.getFullYear(), depart.getMonth(), depart.getDate());
-  const endDay = new Date(back.getFullYear(), back.getMonth(), back.getDate());
-  return Math.round((endDay.getTime() - startDay.getTime()) / 86_400_000) + 1;
+  const tz = a.timeZone || "UTC";
+  return daysBetween(zonedDate(new Date(a.departAt), tz), zonedDate(new Date(a.returnBy), tz)) + 1;
 }
 
 /** Calendar dates the trip spans, as YYYY-MM-DD, for matching weather forecasts. */
 export function tripDates(a: Answers): string[] {
-  const out: string[] = [];
-  const depart = new Date(a.departAt);
-  for (let i = 0; i < tripDays(a); i++) {
-    const d = new Date(depart.getFullYear(), depart.getMonth(), depart.getDate() + i);
-    out.push(
-      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`,
-    );
-  }
-  return out;
+  const tz = a.timeZone || "UTC";
+  const start = zonedDate(new Date(a.departAt), tz);
+  return Array.from({ length: tripDays(a) }, (_, i) => addDays(start, i));
 }
 
 export function maxDriveHours(a: Answers): number {

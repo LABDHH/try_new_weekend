@@ -7,18 +7,13 @@ import {
   type Answers,
 } from "../schema/answers";
 import { fence, sanitizeUserText } from "./sanitize";
+import { zonedHuman, zonedMonthName } from "../time";
 
-const fmt = (iso: string) =>
-  new Date(iso).toLocaleString("en-US", {
-    weekday: "long",
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
+// Both render in the TRAVELLER'S zone, not the server's. Without the zone,
+// toLocaleString on a UTC box tells the model the trip starts on the wrong day.
+const fmt = (iso: string, tz: string) => zonedHuman(new Date(iso), tz);
 
-const monthOf = (iso: string) =>
-  new Date(iso).toLocaleString("en-US", { month: "long" });
+const monthOf = (iso: string, tz: string) => zonedMonthName(new Date(iso), tz);
 
 /**
  * Renders the user's answers into prompt text.
@@ -39,12 +34,14 @@ export function renderProfile(a: Answers): string {
   const extra = sanitizeUserText(a.freeText);
   const band = DRIVE_BUCKETS[a.driveBucket];
 
+  const tz = a.timeZone || "UTC";
+
   const lines = [
     `Starting from: ${a.origin.name}`,
-    `Leaving: ${fmt(a.departAt)}`,
-    `Back by: ${fmt(a.returnBy)}`,
+    `Leaving: ${fmt(a.departAt, tz)}`,
+    `Back by: ${fmt(a.returnBy, tz)}`,
     `Trip length: ${tripDays(a)} day(s)`,
-    `Time of year: ${monthOf(a.departAt)} — factor in what this season is actually like there`,
+    `Time of year: ${monthOf(a.departAt, tz)} — factor in what this season is actually like there`,
     `Who's going: ${WHO[a.who]}`,
     `Budget: ${BUDGET_LEVEL[a.budgetLevel]}`,
     "",

@@ -3,7 +3,6 @@ import { LIMITS } from "../config";
 import { WHO, tripDates, type Answers } from "../schema/answers";
 import type { DayWeather, Destination, EnrichedPlace } from "../schema/places";
 import {
-  addMinutes,
   itinerarySchema,
   minutesBetween,
   normalizeItinerary,
@@ -17,6 +16,7 @@ import { BALANCE_RULES, renderProfile, VOICE_RULES } from "./profile";
 import { fence, sanitizeReview } from "./sanitize";
 import { haversineKm } from "../geo";
 import { confidenceScore } from "../pipeline/hygiene";
+import { zonedDate, zonedTime } from "../time";
 
 const SYSTEM = `
 You are an experienced local guide who plans weekends that people actually
@@ -93,12 +93,31 @@ Give each day 2-4 alternates: a swap if something is closed, if it rains, if
 the queue is long, or if it is not their thing. Say which stop it replaces and
 in what circumstance. Alternates must also come from the supplied list.
 
-# Justifying choices
+# The two lines you write about each stop
 
-Every "why" points at something this traveller actually told us. "Since you
-said no long hikes, this is the viewpoint you can drive to" is a real reason.
-"A lovely spot" is a failure. If you cannot connect a stop to something they
-said, choose a different stop.
+Both are about the PLACE. Neither is about the traveller.
+
+famousFor = the headline. What this place is actually known for.
+detail    = one more concrete fact, mined from the reviews and review summary
+            — the thing a friend who had been there would add.
+
+  famousFor: "A 17th-century fort built by the Kodava rajas, with ramparts
+              looking down the valley."
+  detail:    "Sunrise is why people come early; the mist usually clears
+              around eight."
+
+NEVER explain why you picked it. Do not write "since you wanted somewhere
+scenic" or "this suits your interest in food". Their answers decide what goes
+INTO the itinerary — they are not something you read back to them. They know
+what they asked for. What they do not know is what the place is like.
+
+Rules:
+- No second person in either field. No "you said", "you wanted", "your".
+- detail must add something famousFor did not already say.
+- Mine the reviews for the practical, specific thing: queues, parking, steps,
+  portions, shade, best light, what time it gets busy, how long it really takes.
+- If the reviews say nothing useful, say plainly what the place is and keep it
+  short. Do not pad with adjectives.
 
 # Honesty
 
@@ -242,13 +261,12 @@ export async function composeItinerary(
   const driveMin = Math.round((destination.driveSeconds ?? 0) / 60);
   const departTime = new Date(answers.departAt);
   const returnTime = new Date(answers.returnBy);
-  // Built from the date parts directly: toLocaleTimeString with hour12:false
-  // renders midnight as "24:00" on some ICU builds, which is both wrong in the
-  // prompt and unusable for the window arithmetic below.
-  const fmtTime = (d: Date) =>
-    `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-  const fmtDate = (d: Date) =>
-    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  // Read in the TRAVELLER'S zone. On a UTC server, plain getHours() turns a
+  // 05:00 Saturday departure into Friday 23:30 — wrong day, wrong time, on the
+  // one thing they cannot flex.
+  const tz = answers.timeZone || "UTC";
+  const fmtTime = (d: Date) => zonedTime(d, tz);
+  const fmtDate = (d: Date) => zonedDate(d, tz);
 
   const arrival = new Date(departTime.getTime() + (destination.driveSeconds ?? 0) * 1000);
   const latestDeparture = new Date(returnTime.getTime() - (destination.driveSeconds ?? 0) * 1000);
@@ -386,43 +404,73 @@ function enforceTripWindow(
   itinerary: Itinerary,
   w: TripWindow,
 ): { itinerary: Itinerary; adjusted: number } {
-  let adjusted = 0;
+  const dayIndex = new Map(w.dates.map((d, i) => [d, i]));
   const lastDate = w.dates[w.dates.length - 1];
 
+  const toMin = (hhmm: string) => {
+    const [h, m] = hhmm.split(":").map(Number);
+    return (Number.isFinite(h) ? h : 0) * 60 + (Number.isFinite(m) ? m : 0);
+  };
+  const fromMin = (n: number) =>
+    `${String(Math.floor(n / 60)).padStart(2, "0")}:${String(n % 60).padStart(2, "0")}`;
+
+  /**
+   * Minutes since the start of day one.
+   *
+   * Comparing per-day "HH:MM" strings cannot express "22:00 on Sunday is before
+   * 06:00 on Monday", so a drive home that starts the previous evening silently
+   * escaped the window. Absolute minutes make every comparison plain
+   * arithmetic, whichever day each side falls on.
+   */
+  const abs = (date: string, hhmm: string) => (dayIndex.get(date) ?? 0) * 1440 + toMin(hhmm);
+
+  const floorAbs = abs(w.arrivalDate, w.arrivalTime);
+  const ceilingAbs = abs(w.latestDepartureDate, w.latestDepartureTime);
+
+  let adjusted = 0;
+
   const days = itinerary.days.map((day) => {
-    // Multi-day drives can land the arrival on a later date than departure, so
-    // the floor and ceiling attach to the DATE they actually fall on.
-    const floor = day.date === w.arrivalDate ? w.arrivalTime : "05:00";
-    const ceiling =
-      day.date === w.latestDepartureDate ? w.latestDepartureTime : "23:30";
+    const i = dayIndex.get(day.date) ?? 0;
+    const dayStart = i * 1440;
+    const dayEnd = dayStart + 1439;
+
+    // The slice of THIS day that falls inside the trip window.
+    const openAbs = Math.max(dayStart, floorAbs);
+    const closeAbs = Math.min(dayEnd, ceilingAbs);
 
     const existingDepart = day.stops.find((s) => s.kind === "depart");
     const existingHome = day.stops.find((s) => s.kind === "drive_home");
     const body = day.stops.filter((s) => !TRAVEL_KINDS.has(s.kind));
 
-    // Re-flow the day inside its window. Order is already correct by this
-    // point; this only pins it to the real clock.
     const kept: ItineraryStop[] = [];
-    let prevEnd = floor;
-    for (const stop of body) {
-      const duration = Math.max(15, minutesBetween(stop.startTime, stop.endTime) || 60);
-      const start = stop.startTime < prevEnd ? prevEnd : stop.startTime;
-      if (start >= ceiling) {
-        adjusted++;
-        continue; // The window has closed; this cannot happen today.
-      }
-      let end = addMinutes(start, duration);
-      if (end > ceiling) {
-        // Shorten rather than drop, but only if what remains is still a visit.
-        if (minutesBetween(start, ceiling) < 20) {
+    if (closeAbs > openAbs) {
+      let prevAbs = openAbs;
+      for (const stop of body) {
+        const duration = Math.max(15, minutesBetween(stop.startTime, stop.endTime) || 60);
+        const startAbs = Math.max(dayStart + toMin(stop.startTime), prevAbs);
+        if (startAbs >= closeAbs) {
           adjusted++;
-          continue;
+          continue; // The window has closed; this cannot happen today.
         }
-        end = ceiling;
+        let endAbs = startAbs + duration;
+        if (endAbs > closeAbs) {
+          // Shorten rather than drop, but only if what remains is still a visit.
+          if (closeAbs - startAbs < 20) {
+            adjusted++;
+            continue;
+          }
+          endAbs = closeAbs;
+        }
+        const startTime = fromMin(startAbs - dayStart);
+        const endTime = fromMin(endAbs - dayStart);
+        if (startTime !== stop.startTime || endTime !== stop.endTime) adjusted++;
+        kept.push({ ...stop, startTime, endTime });
+        prevAbs = endAbs;
       }
-      if (start !== stop.startTime || end !== stop.endTime) adjusted++;
-      kept.push({ ...stop, startTime: start, endTime: end });
-      prevEnd = end;
+    } else if (body.length > 0) {
+      // This whole calendar day sits outside the window — they have not arrived
+      // yet, or they are already driving home.
+      adjusted += body.length;
     }
 
     const stops: ItineraryStop[] = [];
@@ -434,7 +482,7 @@ function enforceTripWindow(
           name: "Leave home",
           kind: "depart" as const,
           famousFor: "The drive out.",
-          why: "Timed to the departure you gave us.",
+          detail: "Timed to the stated departure.",
           isHighlight: false,
           optional: false,
         }),
@@ -454,13 +502,15 @@ function enforceTripWindow(
           name: "Drive home",
           kind: "drive_home" as const,
           famousFor: "The road back.",
-          why: "Timed so you are home by the time you asked for.",
+          detail: "Timed to land at the stated return time.",
           isHighlight: false,
           optional: false,
         }),
         placeId: "origin",
         kind: "drive_home",
-        startTime: w.latestDepartureTime,
+        // When the drive starts the previous evening, this day is nothing but
+        // the tail of it.
+        startTime: w.latestDepartureDate === lastDate ? w.latestDepartureTime : "00:00",
         endTime: w.returnTime,
       });
     }
@@ -469,7 +519,15 @@ function enforceTripWindow(
   });
 
   const check = itinerarySchema.safeParse({ ...itinerary, days });
-  if (!check.success) return { itinerary, adjusted: 0 };
+  if (!check.success) {
+    // Reverting would hand back a plan that ignores the clock, which is the one
+    // thing this function exists to prevent. Loud, because it should not happen.
+    console.error(
+      "[gemini:compose] clock enforcement produced an invalid itinerary:",
+      check.error.issues.slice(0, 3).map((x) => `${x.path.join(".")}: ${x.message}`).join("; "),
+    );
+    return { itinerary, adjusted: 0 };
+  }
   return { itinerary: check.data, adjusted };
 }
 
@@ -497,15 +555,6 @@ const KIND_TARGET_TIME: Record<string, string> = {
 
 const EXPERIENCE_KINDS = new Set(["sight", "outdoor", "activity", "viewpoint"]);
 
-/** What each slot is actually for, in words a person would use. */
-const SLOT_LABEL: Record<string, string> = {
-  breakfast: "breakfast", lunch: "lunch", dinner: "dinner",
-  coffee: "a coffee break", dessert: "something sweet",
-  sight: "the day's sightseeing", outdoor: "time outdoors",
-  activity: "an afternoon activity", viewpoint: "golden hour",
-  shopping: "a wander through the shops", evening: "the evening",
-};
-
 /** "hiking_area" -> "hiking area". The most specific true label Google gives us. */
 function humanType(place: EnrichedPlace): string {
   const raw = place.primaryType || place.types?.[0] || place.category;
@@ -530,10 +579,7 @@ function tidy(text: string | undefined, max = 400): string | undefined {
  * says plainly what it is and which part of the day it is filling, rather than
  * inventing a reputation for it.
  */
-function describeBackfill(
-  place: EnrichedPlace,
-  kind: string,
-): { famousFor: string; why: string } {
+function describeBackfill(place: EnrichedPlace): { famousFor: string; detail: string } {
   const editorial = tidy(place.editorialSummary);
   const summary = tidy(place.reviewSummary);
   const type = humanType(place);
@@ -549,12 +595,12 @@ function describeBackfill(
     .filter((r): r is string => r !== undefined && r.length >= 40)
     .sort((a, b) => b.length - a.length)[0];
 
-  const why =
+  const detail =
     spare ??
     (reviewLine ? `What visitors single out: ${reviewLine}` : undefined) ??
-    `A ${type} close to the day's other stops, picked for ${SLOT_LABEL[kind] ?? "this part of the day"}.`;
+    `A ${type} near the day's other stops. Google carries no description for it beyond the basics.`;
 
-  return { famousFor, why };
+  return { famousFor, detail };
 }
 
 /**
@@ -642,7 +688,7 @@ function backfillThinDays(
       used.add(ref);
       added++;
 
-      const { famousFor, why } = describeBackfill(place, kind);
+      const { famousFor, detail } = describeBackfill(place);
 
       additions.push({
         placeId: ref,
@@ -651,7 +697,7 @@ function backfillThinDays(
         startTime: start,
         endTime: start,
         famousFor,
-        why,
+        detail,
         isHighlight: false,
         optional: false,
         ...(place.sparseData ? { headsUp: "Few ratings, so this one is less of a sure thing." } : {}),
@@ -851,6 +897,19 @@ function verifyItinerary(
       break;
     }
     seen.add(stop.placeId);
+  }
+
+  // Text that narrates the choice back at the traveller. Their answers pick
+  // what goes in; reading that decision out to them adds nothing they did not
+  // already know, and a whole day of it reads as generated.
+  const ADDRESSED = /\b(since|as|because)\s+you\b|\byou\s+(said|asked|wanted|mentioned|chose|picked)\b|\byour\s+(interest|preference|budget|group|trip)\b/i;
+  const addressed = allStops
+    .filter((st) => !TRAVEL_KINDS.has(st.kind))
+    .filter((st) => ADDRESSED.test(st.detail) || ADDRESSED.test(st.famousFor));
+  if (addressed.length > 0) {
+    soft.push(
+      `${addressed.length} stop(s) explain the choice back to the traveller (e.g. "${addressed[0].name}"). Both lines are about the PLACE — say what it is known for, not why it was picked.`,
+    );
   }
 
   // The clock. SOFT rather than hard on purpose: enforceTripWindow guarantees

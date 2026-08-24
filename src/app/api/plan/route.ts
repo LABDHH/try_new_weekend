@@ -51,6 +51,15 @@ export async function POST(req: NextRequest) {
   }
   const answers = parsed.data;
 
+  // A missing zone means an older cached bundle: the plan still works, but
+  // every wall-clock reading silently falls back to the server's UTC. Loud in
+  // the logs, because the symptom (wrong departure day) looks like a model bug.
+  if (!(body as { timeZone?: string })?.timeZone) {
+    console.warn(
+      "[plan] request carried no timeZone — wall-clock times will fall back to UTC and may show the wrong day.",
+    );
+  }
+
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();

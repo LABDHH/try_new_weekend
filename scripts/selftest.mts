@@ -223,12 +223,31 @@ section("Output guardrails");
 const validIds = new Set(["p1","p2","p3","p4","p5","p6","p7","p8","p9","p10","alt1"]);
 const dates = ["2026-09-05", "2026-09-06"];
 
+// Facts ABOUT THE PLACE, never about the traveller — text that explains the
+// choice back at them is itself a soft failure now, so a fixture written the
+// old way would fail the "clean itinerary" tests for the right reason.
+const DETAILS = [
+  "The path is paved the whole way, so nobody has to scramble.",
+  "Reviewers keep saying it empties out after four.",
+  "Portions are big enough that two of you can share.",
+  "Parking sits right at the gate, which matters after the drive.",
+  "Opening hours run late, so a slow start does not kill it.",
+  "Shade covers most of the seating, per several reviews.",
+  "Queues build after eleven; before that it is quiet.",
+  "Staff are used to kids, which a lot of reviews mention.",
+  "Steps are shallow and there is a handrail most of the way.",
+  "Cash only, but the counter is quick about it.",
+  "Best light falls on the valley an hour before sunset.",
+  "Bookings are rarely needed midweek, unlike the weekend.",
+];
+let whyCursor = 0;
+
 const mkStop = (o: Partial<Itinerary["days"][0]["stops"][0]> & { placeId: string; name: string }) => ({
   kind: "sight" as const,
   startTime: "10:00",
   endTime: "11:00",
   famousFor: "Known for a specific concrete thing worth seeing.",
-  why: "because you said scenic",
+  detail: DETAILS[whyCursor++ % DETAILS.length],
   isHighlight: false,
   optional: false,
   ...o,

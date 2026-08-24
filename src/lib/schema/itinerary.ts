@@ -24,8 +24,15 @@ export const stopSchema = z.object({
   endTime: z.string().regex(/^\d{2}:\d{2}$/, "Expected HH:MM"),
   /** What this place is actually known for — the concrete draw, not adjectives. */
   famousFor: z.string().min(5).max(600).describe("What this place is concretely known for. 1-2 sentences, under 400 characters."),
-  /** Must cite something the user actually answered. Graded, not just parsed. */
-  why: z.string().min(5).max(600).describe("Why this suits THIS traveller, citing something they said. Under 300 characters."),
+  /**
+   * A second concrete fact about the PLACE, from the review data.
+   *
+   * Deliberately not a justification. The traveller's answers decide what goes
+   * into the itinerary; narrating that decision back at them ("since you
+   * wanted somewhere scenic...") tells them only what they already know, and
+   * a whole day of it reads like a form letter.
+   */
+  detail: z.string().min(5).max(600).describe("One more concrete fact about the place, from its reviews. Never address the traveller or explain the choice. Under 300 characters."),
   /** How you get here from the previous stop: "10 min walk", "25 min drive". */
   travelFromPrevious: z.string().max(160).optional().describe("Leave this out — it is computed from real coordinates."),
   /** Practical friction-remover: "book ahead", "closed Mondays", "cash only". */
@@ -49,12 +56,12 @@ export const daySchema = z.object({
   /** Two or three sentences setting up the shape of the day. */
   narrative: z.string().min(20).max(1200).describe("2-3 sentences setting up the shape of the day."),
   weatherNote: z.string().max(600).optional(),
-  // Hard floor is deliberately below the target: a genuinely thin destination
-  // (small town, sparse pool) can have an honest 2-3 stop day. Below that is
-  // not a real day plan. verifyItinerary's soft check still nudges toward the
-  // 6-9 target — this only stops a hard Zod rejection burning repair attempts
-  // on data scarcity the model cannot fix by trying again.
-  stops: z.array(stopSchema).min(2).max(12).describe("6 to 9 stops covering the whole day, meals included."),
+  // Hard floor is deliberately far below the target. A genuinely thin
+  // destination can have an honest 2-3 stop day, and a final day where the
+  // drive home starts the previous evening is legitimately ONE stop. Rejecting
+  // those costs the traveller their whole itinerary over an honest edge case.
+  // verifyItinerary's soft check still nudges toward the 6-9 target.
+  stops: z.array(stopSchema).min(1).max(12).describe("6 to 9 stops covering the whole day, meals included."),
   /** Swaps if something is closed, rained off, or not their thing. */
   alternates: z.array(alternateSchema).max(6).describe("2-4 swaps if something is closed or rained off."),
 });
@@ -328,7 +335,10 @@ export function normalizeItinerary(raw: unknown): unknown {
           ...st,
           name: clamp(st.name, 300),
           famousFor: clamp(st.famousFor, 600),
-          why: clamp(st.why, 600),
+          // `why` is the old name for this field. Itineraries saved before the
+          // rename still carry it, and the model occasionally reaches for it
+          // too — neither is worth failing an otherwise good plan over.
+          detail: clamp(st.detail ?? st.why, 600),
           travelFromPrevious: clamp(st.travelFromPrevious, 160),
           headsUp: clamp(st.headsUp, 400),
           // Booleans are required by the schema but easy for a model to omit.

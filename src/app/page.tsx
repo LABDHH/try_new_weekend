@@ -7,6 +7,7 @@ import { PlanningScreen } from "@/components/flow/PlanningScreen";
 import { ItineraryView } from "@/components/trip/Itinerary";
 import type { PlanEvent } from "@/lib/schema/events";
 import type { Itinerary } from "@/lib/schema/itinerary";
+import { detectTimeZone } from "@/lib/time";
 
 type Phase = "intro" | "questions" | "planning" | "done" | "error";
 
@@ -44,8 +45,13 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           origin: { name: origin.name, lat: origin.lat, lng: origin.lng },
+          // The picker gives a naive local wall-clock string, so toISOString
+          // produces the correct INSTANT — but the server runs in UTC and would
+          // read the wall clock back wrong. The zone is what lets it recover
+          // the time they actually chose.
           departAt: new Date(draft.departAt).toISOString(),
           returnBy: new Date(draft.returnBy).toISOString(),
+          timeZone: detectTimeZone(),
           driveBucket: draft.driveBucket,
           who: draft.who,
           focus: draft.focus,

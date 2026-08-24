@@ -246,13 +246,13 @@ function Stop({ stop, isLast }: { stop: ItineraryStop; isLast: boolean }) {
             onClick={() => setShowWhy((v) => !v)}
             className="font-sans text-xs text-muted underline underline-offset-4 transition hover:text-primary"
           >
-            {showWhy ? "Hide" : "Why this?"}
+            {showWhy ? "Hide" : "More about this"}
           </button>
         </div>
 
         {showWhy && (
           <p className="mt-3 max-w-prose border-l-2 border-amber-400/50 py-1 pl-4 font-sans text-sm leading-relaxed text-secondary">
-            {stop.why}
+            {stop.detail ?? (stop as { why?: string }).why}
           </p>
         )}
       </div>
