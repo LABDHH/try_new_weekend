@@ -1,4 +1,4 @@
-import { LIMITS, PLACE_CATEGORIES } from "../config";
+import { FINALIST_QUOTAS, LIMITS, PLACE_CATEGORIES } from "../config";
 import type { PoolPlace } from "../schema/places";
 import { confidenceScore } from "./hygiene";
 
@@ -50,6 +50,63 @@ export function packPool(places: PoolPlace[], limit: number = LIMITS.MAX_POOL_FO
       }
     }
     if (!addedThisRound) break;
+  }
+
+  return out;
+}
+
+/**
+ * Chooses the finalists compose actually builds the day from.
+ *
+ * The shortlist model's ranking still leads WITHIN each category — this only
+ * decides how many slots each category gets, so that the set handed to compose
+ * can actually support breakfast, an evening option and two experiences a day.
+ *
+ * Fills to quota first, then hands leftover slots to whichever categories still
+ * have candidates. A destination with no nightlife gets more sights rather than
+ * a wasted slot.
+ */
+export function selectFinalists(
+  orderedIds: string[],
+  byId: Map<string, PoolPlace>,
+  limit: number = LIMITS.MAX_SHORTLIST,
+): string[] {
+  const byCategory = new Map<string, string[]>();
+  for (const id of orderedIds) {
+    const place = byId.get(id);
+    if (!place) continue;
+    const list = byCategory.get(place.category) ?? [];
+    list.push(id);
+    byCategory.set(place.category, list);
+  }
+
+  const categories = PLACE_CATEGORIES.map((c) => c.key).filter((k) => byCategory.has(k));
+  const taken = new Map<string, number>();
+  const out: string[] = [];
+
+  // Pass 1 — every category up to its quota, so nothing is starved.
+  for (const cat of categories) {
+    if (out.length >= limit) break;
+    const list = byCategory.get(cat)!;
+    const quota = Math.min(FINALIST_QUOTAS[cat] ?? 2, list.length, limit - out.length);
+    out.push(...list.slice(0, quota));
+    taken.set(cat, quota);
+  }
+
+  // Pass 2 — redistribute whatever quota went unused.
+  while (out.length < limit) {
+    let added = false;
+    for (const cat of categories) {
+      if (out.length >= limit) break;
+      const list = byCategory.get(cat)!;
+      const i = taken.get(cat) ?? 0;
+      if (i < list.length) {
+        out.push(list[i]);
+        taken.set(cat, i + 1);
+        added = true;
+      }
+    }
+    if (!added) break;
   }
 
   return out;

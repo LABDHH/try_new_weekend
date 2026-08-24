@@ -49,7 +49,12 @@ export const daySchema = z.object({
   /** Two or three sentences setting up the shape of the day. */
   narrative: z.string().min(20).max(1200).describe("2-3 sentences setting up the shape of the day."),
   weatherNote: z.string().max(600).optional(),
-  stops: z.array(stopSchema).min(4).max(12).describe("6 to 9 stops covering the whole day, meals included."),
+  // Hard floor is deliberately below the target: a genuinely thin destination
+  // (small town, sparse pool) can have an honest 2-3 stop day. Below that is
+  // not a real day plan. verifyItinerary's soft check still nudges toward the
+  // 6-9 target — this only stops a hard Zod rejection burning repair attempts
+  // on data scarcity the model cannot fix by trying again.
+  stops: z.array(stopSchema).min(2).max(12).describe("6 to 9 stops covering the whole day, meals included."),
   /** Swaps if something is closed, rained off, or not their thing. */
   alternates: z.array(alternateSchema).max(6).describe("2-4 swaps if something is closed or rained off."),
 });

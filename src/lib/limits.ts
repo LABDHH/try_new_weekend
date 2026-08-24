@@ -35,6 +35,10 @@ export const LIMITS = {
    * Finalists we fetch reviews for. Sized for a SMALL model: enough to build a
    * full day with alternates, few enough that the compose payload stays inside
    * the range where Flash-Lite reasons reliably.
+   *
+   * COUNT IS NOT THE LEVER HERE — composition is. Raising this makes Flash-Lite
+   * worse, not better (see pack.ts). What a full day actually needs is every
+   * category represented, which FINALIST_QUOTAS below guarantees.
    */
   MAX_SHORTLIST: 28,
 
@@ -63,9 +67,12 @@ export const LIMITS = {
 
 /** Per-request ceilings. Exceeding any of these aborts rather than silently spending. */
 export const BUDGET = {
-  MAX_GEMINI_CALLS: 6, // 3 planned + up to 3 repair retries
+  MAX_GEMINI_CALLS: 8, // 3 planned + up to 5 repair retries
   MAX_MAPS_CALLS: 90, // 13 geocode + 1 matrix + 3 weather + 15 core places + 4 extra places + 42 details, with headroom
-  MAX_REPAIR_ATTEMPTS: 3, // structured-output repair loops before giving up
+  // Compose (the hardest stage) can burn through this on its own in a bad
+  // case — the cap is a total across the whole pipeline, not per stage, sized
+  // on the assumption that usually only one stage needs repairing.
+  MAX_REPAIR_ATTEMPTS: 5, // structured-output repair loops before giving up
   /**
    * Whole-pipeline deadline. Deliberately BELOW the platform's maxDuration
    * (120s on the plan route): if these are equal, the function is killed
@@ -104,6 +111,32 @@ export const EXTRA_CATEGORIES = [
 ] as const;
 
 export const PLACE_CATEGORIES = [...CORE_CATEGORIES, ...EXTRA_CATEGORIES] as const;
+
+/**
+ * Target share of the finalist set per category.
+ *
+ * These exist because the old selection — shortlist ids first, extras appended,
+ * then a slice to MAX_SHORTLIST — discarded EVERY extra-category place whenever
+ * the shortlist came back full, which the prompt explicitly asks for (25-35 ids
+ * against a cap of 28). Compose was then told to build a day with breakfast and
+ * an evening option from a list that contained neither, and a thin day was the
+ * only honest thing it could return.
+ *
+ * Weighted toward experiences because those are the day's backbone and the
+ * balance rules require at least two per day. Unfilled quota is redistributed,
+ * so a destination with no nightlife simply gets more sights instead.
+ */
+export const FINALIST_QUOTAS: Record<string, number> = {
+  attraction: 6,
+  nature: 5,
+  food: 5,
+  cafe: 3,
+  stay: 2,
+  breakfast: 2,
+  dessert: 2,
+  nightlife: 2,
+  shopping: 2,
+};
 
 export type PlaceCategory = (typeof PLACE_CATEGORIES)[number]["key"];
 

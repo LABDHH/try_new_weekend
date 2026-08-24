@@ -14,7 +14,7 @@ import type { PlanEvent } from "../schema/events";
 import type { DayWeather, Destination, EnrichedPlace, PoolPlace } from "../schema/places";
 import type { Itinerary } from "../schema/itinerary";
 import { applyHygiene, confidenceScore } from "./hygiene";
-import { packPool } from "./pack";
+import { packPool, selectFinalists } from "./pack";
 
 export type Emit = (e: PlanEvent) => void;
 
@@ -228,7 +228,11 @@ export async function planTrip(answers: Answers, emit: Emit): Promise<PlanResult
 
   const shortlistIds = shortlist.placeIds.filter((id) => byId.has(id));
   const extraIds = extras.map((e) => e.id).filter((id) => !shortlistIds.includes(id));
-  const finalistIds = [...shortlistIds, ...extraIds].slice(0, LIMITS.MAX_SHORTLIST);
+  // Category-balanced, NOT a plain slice. The shortlist is requested as 25-35
+  // ids against a cap of 28, so appending extras and slicing dropped all of
+  // them — every breakfast, dessert and evening place — exactly whenever the
+  // model did what it was asked. See selectFinalists.
+  const finalistIds = selectFinalists([...shortlistIds, ...extraIds], byId, LIMITS.MAX_SHORTLIST);
 
   const enrichment = await enrichMany(finalistIds, budget);
 

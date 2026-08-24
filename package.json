@@ -11,7 +11,7 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "selftest": "tsx scripts/selftest.ts",
+    "selftest": "tsx scripts/selftest.mts",
     "check:bundle": "tsx scripts/check-bundle.ts",
     "probe:apis": "tsx --env-file=.env.local scripts/probe-apis.ts",
     "probe:models": "tsx --env-file=.env.local scripts/probe-models.ts",

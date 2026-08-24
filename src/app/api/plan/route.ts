@@ -4,35 +4,27 @@ import { encodeEvent, type PlanEvent } from "@/lib/schema/events";
 import { planTrip } from "@/lib/pipeline/orchestrate";
 import { toPlannerError } from "@/lib/errors";
 import { cacheKey, findCached, saveTrip } from "@/lib/store/supabase";
+import { checkLimits, clientIp, recordCompletion, sharedStoreConfigured } from "@/lib/ratelimit";
 
 export const runtime = "nodejs";
 // The pipeline runs 25-45s; Vercel's default function timeout is shorter.
 export const maxDuration = 120;
 
-/** Crude per-IP throttle. In-memory, so it resets on deploy — enough for an MVP. */
-const recent = new Map<string, number[]>();
-const WINDOW_MS = 60_000;
-const MAX_PER_WINDOW = 5;
-
-function rateLimited(ip: string): boolean {
-  const now = Date.now();
-  const hits = (recent.get(ip) ?? []).filter((t) => now - t < WINDOW_MS);
-  hits.push(now);
-  recent.set(ip, hits);
-  if (recent.size > 5000) recent.clear(); // crude bound on memory growth
-  return hits.length > MAX_PER_WINDOW;
-}
-
 export async function POST(req: NextRequest) {
-  const ip =
-    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
-    req.headers.get("x-real-ip") ??
-    "unknown";
+  const ip = clientIp(req);
 
-  if (rateLimited(ip)) {
+  // Checked BEFORE validation and before any paid call. A blocked request
+  // should cost a function invocation and nothing else.
+  const verdict = await checkLimits(ip);
+  if (!verdict.allowed) {
+    if (!sharedStoreConfigured()) {
+      console.warn(
+        "[plan] rate limit hit, but no shared store is configured — limits are per-instance only and will not hold under real traffic.",
+      );
+    }
     return Response.json(
-      { error: "Too many requests. Give it a minute." },
-      { status: 429 },
+      { error: verdict.message, reason: verdict.reason },
+      { status: 429, headers: { "Retry-After": String(verdict.retryAfterSeconds) } },
     );
   }
 
@@ -106,6 +98,7 @@ export async function POST(req: NextRequest) {
           destinationName: destination.name,
         });
 
+        await recordCompletion();
         send({ type: "done", itinerary, tripId: tripId ?? undefined, debug });
       } catch (e) {
         const err = toPlannerError(e);

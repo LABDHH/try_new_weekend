@@ -57,6 +57,8 @@ export default function Home() {
 
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
+        // 429 is an expected, explainable state — not a crash. The server's
+        // message already says whether it is a personal limit or a daily cap.
         throw new Error(body.error ?? "Something went wrong.");
       }
       if (!res.body) throw new Error("No response from the planner.");

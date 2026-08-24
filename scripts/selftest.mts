@@ -561,6 +561,30 @@ check("bounding box brackets the origin",
   box.low.longitude < blr.lng && box.high.longitude > blr.lng);
 check("bounding box latitude stays in range", box.low.latitude >= -90 && box.high.latitude <= 90);
 
+
+// --- Rate limiting ---------------------------------------------------------
+section("Rate limiting");
+
+const { checkLimits, RATE_LIMITS, sharedStoreConfigured } = await import("../src/lib/ratelimit");
+
+check("per-IP limit is configured", RATE_LIMITS.PER_IP > 0);
+check("daily cap is configured", RATE_LIMITS.DAILY_CAP > 0);
+check("daily cap exceeds per-IP limit", RATE_LIMITS.DAILY_CAP > RATE_LIMITS.PER_IP);
+check("shared store correctly reported as absent in tests", sharedStoreConfigured() === false);
+
+// In-memory fallback still enforces the per-IP limit within one instance.
+const ip = `test-${Math.random()}`;
+let blocked: Awaited<ReturnType<typeof checkLimits>> | null = null;
+for (let i = 0; i < RATE_LIMITS.PER_IP + 1; i++) {
+  const v = await checkLimits(ip);
+  if (!v.allowed) blocked = v;
+}
+check("per-IP limit blocks after the allowance", blocked !== null && blocked.reason === "per_ip",
+  JSON.stringify(blocked));
+check("blocked response carries a retry hint",
+  blocked !== null && blocked.allowed === false && blocked.retryAfterSeconds > 0);
+check("a different IP is unaffected", (await checkLimits(`other-${Math.random()}`)).allowed === true);
+
 // --------------------------------------------------------------- RESULT
 console.log(`\n${"=".repeat(48)}`);
 console.log(`  ${pass} passed, ${fail} failed`);

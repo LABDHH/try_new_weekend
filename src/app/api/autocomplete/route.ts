@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { Budget } from "@/lib/budget";
 import { env } from "@/lib/config";
 import { fetchJson } from "@/lib/http";
+import { checkAutocompleteLimit, clientIp } from "@/lib/ratelimit";
 
 export const runtime = "nodejs";
 
@@ -16,6 +17,16 @@ export async function GET(req: NextRequest) {
   const input = req.nextUrl.searchParams.get("q")?.trim() ?? "";
   if (input.length < 2 || input.length > 160) {
     return Response.json({ suggestions: [] });
+  }
+
+  // Checked before any paid call — this endpoint fires on every keystroke and
+  // has no per-plan cost ceiling to fall back on.
+  const verdict = await checkAutocompleteLimit(clientIp(req));
+  if (!verdict.allowed) {
+    return Response.json(
+      { suggestions: [], error: true },
+      { status: 429, headers: { "Retry-After": String(verdict.retryAfterSeconds) } },
+    );
   }
 
   const budget = new Budget();
@@ -79,6 +90,14 @@ export async function GET(req: NextRequest) {
  * city that happens to share a name.
  */
 export async function POST(req: NextRequest) {
+  const verdict = await checkAutocompleteLimit(clientIp(req));
+  if (!verdict.allowed) {
+    return Response.json(
+      { error: verdict.message },
+      { status: 429, headers: { "Retry-After": String(verdict.retryAfterSeconds) } },
+    );
+  }
+
   let body: { placeId?: string };
   try {
     body = await req.json();

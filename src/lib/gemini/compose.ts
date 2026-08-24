@@ -8,11 +8,13 @@ import {
   REPEATABLE_KINDS,
   TRAVEL_KINDS,
   type Itinerary,
+  type ItineraryStop,
 } from "../schema/itinerary";
 import { generateStructured } from "./client";
 import { BALANCE_RULES, renderProfile, VOICE_RULES } from "./profile";
 import { fence, sanitizeReview } from "./sanitize";
 import { haversineKm } from "../geo";
+import { confidenceScore } from "../pipeline/hygiene";
 
 const SYSTEM = `
 You are an experienced local guide who plans weekends that people actually
@@ -114,6 +116,18 @@ trust than false confidence. Put real risks in caveats.
 Tiebreak: prefer the signal that would RUIN the trip if ignored over the one
 that would merely disappoint.
 
+# Preferences are best effort — a full day is not
+
+These two rules never trade against each other:
+- Satisfy as many of their preferences as the real data allows. Where you
+  cannot satisfy one, pick the closest thing that IS available and say what you
+  compromised on in caveats. Missing one preference is a normal outcome.
+- A full day is NOT negotiable. Never return a short day, drop a meal, or leave
+  a gap because a preference was hard to satisfy. If nothing in the list fits a
+  preference perfectly, choose the best available option anyway and flag it —
+  an honest 8-stop day with two compromises beats a 3-stop day that only
+  contains perfect matches.
+
 ${BALANCE_RULES}
 
 # Travel stops
@@ -129,8 +143,13 @@ check out on the last day. That is expected, not a repeat.
 # Absolute constraint
 
 Use ONLY places from the supplied list, referenced by their exact id. Never
-invent a place, an address, a dish, or a fact. If the list genuinely cannot
-fill a day, build a shorter day and explain why in caveats.
+invent a place, an address, a dish, or a fact. This one does not bend: a real
+place you are unsure about is always better than a plausible invention.
+
+Fill the day from that list. It contains every category a day needs, so
+"nothing suitable" almost always means "nothing perfect" — take the closest
+real option and note the compromise in caveats. Only build a short day if the
+list is genuinely exhausted, and say exactly what was missing.
 `.trim();
 
 /**
@@ -281,7 +300,178 @@ ${VOICE_RULES}
     verify: (v) => verifyItinerary(v, validIds, dates, foodFocused),
   });
 
-  return hydrateRefs(draft, refMap);
+  // Runs only when the repair loop has already had its chances and a day is
+  // still thin. Filling from real data beats showing a three-stop weekend.
+  const { itinerary: filled, added } = backfillThinDays(draft, refMap);
+  if (added > 0) {
+    console.warn(`[gemini:compose] backfilled ${added} stop(s) into thin day(s)`);
+    filled.caveats = [
+      ...filled.caveats,
+      "A few stops were filled in from the best-rated nearby options to round out the day.",
+    ].slice(0, 8);
+  }
+
+  return hydrateRefs(filled, refMap);
+}
+
+/** Below this a day does not read as a plan, whatever the model returned. */
+const TARGET_STOPS_PER_DAY = 6;
+
+/** Which pool categories can legitimately serve each stop kind. */
+const KIND_SOURCES: Record<string, string[]> = {
+  breakfast: ["breakfast", "cafe"],
+  coffee: ["cafe", "dessert"],
+  lunch: ["food"],
+  dinner: ["food"],
+  dessert: ["dessert", "cafe"],
+  sight: ["attraction"],
+  outdoor: ["nature"],
+  activity: ["attraction", "nature"],
+  viewpoint: ["nature", "attraction"],
+  shopping: ["shopping"],
+  evening: ["nightlife"],
+};
+
+/** Where each kind naturally sits in a day, used to place a backfilled stop. */
+const KIND_TARGET_TIME: Record<string, string> = {
+  breakfast: "08:30", coffee: "10:30", sight: "11:00", outdoor: "11:30",
+  lunch: "13:00", activity: "15:00", shopping: "16:00", dessert: "16:30",
+  viewpoint: "17:30", dinner: "19:30", evening: "21:00",
+};
+
+const EXPERIENCE_KINDS = new Set(["sight", "outdoor", "activity", "viewpoint"]);
+
+/**
+ * GUARANTEED-OUTPUT LAYER.
+ *
+ * The repair loop gives the model several chances to build a full day, and it
+ * usually does. When it does not — Flash-Lite losing the thread on a long
+ * structured document is the common case — the choice is between showing the
+ * traveller a three-stop day and filling the gaps from the same real, enriched
+ * place data the model was working from.
+ *
+ * This is the same reasoning as the schedule repair in normalizeItinerary:
+ * arithmetic and gap-filling are what code gets right and a small model gets
+ * wrong. It never invents a place — every backfilled stop is a real finalist
+ * with real ratings — and the prose is deliberately plain rather than
+ * pretending to cite something the traveller said.
+ */
+function backfillThinDays(
+  itinerary: Itinerary,
+  refMap: Map<string, EnrichedPlace>,
+): { itinerary: Itinerary; added: number } {
+  const used = new Set<string>();
+  for (const day of itinerary.days) {
+    for (const s of day.stops) used.add(s.placeId);
+    for (const a of day.alternates) used.add(a.placeId);
+  }
+
+  let added = 0;
+
+  const days = itinerary.days.map((day) => {
+    if (day.stops.length >= TARGET_STOPS_PER_DAY) return day;
+
+    const kinds = new Set<string>(day.stops.map((s) => s.kind));
+    const capacity = 9 - day.stops.length;
+    const wanted: string[] = [];
+
+    // Meals first — a day missing them is obviously incomplete.
+    for (const meal of ["breakfast", "lunch", "dinner"]) {
+      if (!kinds.has(meal)) wanted.push(meal);
+    }
+
+    // Then up to the two-experience floor the balance rules require.
+    let experiences = day.stops.filter((s) => EXPERIENCE_KINDS.has(s.kind)).length;
+    for (const k of ["sight", "outdoor", "viewpoint", "activity"]) {
+      if (experiences >= 2) break;
+      wanted.push(k);
+      experiences++;
+    }
+
+    // Then contrast. This list is deliberately longer than needed — entries get
+    // skipped when their slot has already passed or the category is exhausted,
+    // and the pick loop below stops as soon as the day is full.
+    for (const k of ["coffee", "viewpoint", "shopping", "dessert", "evening", "sight", "outdoor", "activity"]) {
+      if (!kinds.has(k) && !wanted.includes(k)) wanted.push(k);
+    }
+
+    // The day's real window. The drive home is a hard ceiling, and the arrival
+    // is a floor — a day you reach at 11:00 does not get a breakfast stop just
+    // because the day was thin.
+    const homeStop = day.stops.find((s) => s.kind === "drive_home");
+    const departStop = day.stops.find((s) => s.kind === "depart");
+    const ceiling = homeStop?.startTime ?? "23:00";
+    const floor = departStop?.endTime ?? "00:00";
+
+    const additions: ItineraryStop[] = [];
+    for (const kind of wanted) {
+      if (additions.length >= capacity) break;
+      if (day.stops.length + additions.length >= TARGET_STOPS_PER_DAY) break;
+      const start = KIND_TARGET_TIME[kind] ?? "12:00";
+      if (start >= ceiling || start < floor) continue;
+
+      let picked: [string, EnrichedPlace] | undefined;
+      for (const cat of KIND_SOURCES[kind] ?? []) {
+        const candidates = [...refMap.entries()]
+          .filter(([ref, p]) => !used.has(ref) && p.category === cat)
+          .sort((a, b) => confidenceScore(b[1]) - confidenceScore(a[1]));
+        if (candidates.length) {
+          picked = candidates[0];
+          break;
+        }
+      }
+      if (!picked) continue;
+
+      const [ref, place] = picked;
+      used.add(ref);
+      added++;
+
+      const rated =
+        place.rating && place.ratingCount
+          ? `${place.rating}/5 from ${place.ratingCount} ratings`
+          : "not widely rated yet";
+
+      additions.push({
+        placeId: ref,
+        name: place.name,
+        kind: kind as ItineraryStop["kind"],
+        startTime: start,
+        endTime: start,
+        famousFor:
+          place.editorialSummary ||
+          place.reviewSummary ||
+          `A well-regarded ${place.category} option in the area.`,
+        why: `Added to round out the day — ${rated}.`,
+        isHighlight: false,
+        optional: false,
+        ...(place.sparseData ? { headsUp: "Few ratings, so this one is less of a sure thing." } : {}),
+      });
+    }
+
+    if (additions.length === 0) return day;
+
+    // depart stays first and drive_home last; everything else sorts by clock.
+    const middle = [...day.stops.filter((s) => !TRAVEL_KINDS.has(s.kind)), ...additions].sort(
+      (a, b) => a.startTime.localeCompare(b.startTime),
+    );
+
+    return {
+      ...day,
+      stops: [
+        ...(departStop ? [departStop] : []),
+        ...middle,
+        ...(homeStop ? [homeStop] : []),
+      ],
+    };
+  });
+
+  // normalizeItinerary owns the schedule arithmetic — reuse it rather than
+  // reimplementing overlap repair here, then confirm the result still parses.
+  const repaired = normalizeItinerary({ ...itinerary, days });
+  const check = itinerarySchema.safeParse(repaired);
+  if (!check.success) return { itinerary, added: 0 };
+
+  return { itinerary: check.data, added };
 }
 
 /**
@@ -455,5 +645,5 @@ function verifyItinerary(
   return { hard: issues, soft };
 }
 
-export { verifyItinerary };
+export { verifyItinerary, backfillThinDays };
 export const COMPOSE_LIMITS = { maxReviews: LIMITS.MAX_REVIEWS_PER_PLACE };
