@@ -274,14 +274,14 @@ export function coerceTime(value: unknown): string | undefined {
   return undefined;
 }
 
-function minutesBetween(start: string, end: string): number {
+export function minutesBetween(start: string, end: string): number {
   const [sh, sm] = start.split(":").map(Number);
   const [eh, em] = end.split(":").map(Number);
   if (![sh, sm, eh, em].every(Number.isFinite)) return 0;
   return eh * 60 + em - (sh * 60 + sm);
 }
 
-function addMinutes(hhmm: string, minutes: number): string {
+export function addMinutes(hhmm: string, minutes: number): string {
   const [h, m] = hhmm.split(":").map(Number);
   if (!Number.isFinite(h) || !Number.isFinite(m)) return hhmm;
   const total = Math.min(23 * 60 + 59, h * 60 + m + minutes);

@@ -3,7 +3,9 @@ import { LIMITS } from "../config";
 import { WHO, tripDates, type Answers } from "../schema/answers";
 import type { DayWeather, Destination, EnrichedPlace } from "../schema/places";
 import {
+  addMinutes,
   itinerarySchema,
+  minutesBetween,
   normalizeItinerary,
   REPEATABLE_KINDS,
   TRAVEL_KINDS,
@@ -240,11 +242,27 @@ export async function composeItinerary(
   const driveMin = Math.round((destination.driveSeconds ?? 0) / 60);
   const departTime = new Date(answers.departAt);
   const returnTime = new Date(answers.returnBy);
+  // Built from the date parts directly: toLocaleTimeString with hour12:false
+  // renders midnight as "24:00" on some ICU builds, which is both wrong in the
+  // prompt and unusable for the window arithmetic below.
   const fmtTime = (d: Date) =>
-    d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+    `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const fmtDate = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
   const arrival = new Date(departTime.getTime() + (destination.driveSeconds ?? 0) * 1000);
   const latestDeparture = new Date(returnTime.getTime() - (destination.driveSeconds ?? 0) * 1000);
+
+  const window: TripWindow = {
+    dates,
+    departTime: fmtTime(departTime),
+    departDate: fmtDate(departTime),
+    arrivalTime: fmtTime(arrival),
+    arrivalDate: fmtDate(arrival),
+    latestDepartureTime: fmtTime(latestDeparture),
+    latestDepartureDate: fmtDate(latestDeparture),
+    returnTime: fmtTime(returnTime),
+  };
 
   const prompt = `
 ${renderProfile(answers)}
@@ -297,12 +315,16 @@ ${VOICE_RULES}
     // reliability matters far more here than phrasing variety.
     temperature: 0.4,
     normalize: normalizeItinerary,
-    verify: (v) => verifyItinerary(v, validIds, dates, foodFocused),
+    verify: (v) => verifyItinerary(v, validIds, dates, foodFocused, window),
   });
+
+  // Pin to the real clock BEFORE backfilling, so backfill sees the true window
+  // and never places a stop the traveller could not reach.
+  const pinned = enforceTripWindow(draft, window);
 
   // Runs only when the repair loop has already had its chances and a day is
   // still thin. Filling from real data beats showing a three-stop weekend.
-  const { itinerary: filled, added } = backfillThinDays(draft, refMap);
+  const { itinerary: filled, added } = backfillThinDays(pinned.itinerary, refMap);
   if (added > 0) {
     console.warn(`[gemini:compose] backfilled ${added} stop(s) into thin day(s)`);
     filled.caveats = [
@@ -311,11 +333,145 @@ ${VOICE_RULES}
     ].slice(0, 8);
   }
 
-  return hydrateRefs(filled, refMap);
+  // Again after backfill: normalizeItinerary repairs overlaps without any
+  // knowledge of the window, so it can push a stop past the return time. This
+  // pass is the one that actually guarantees the clock holds.
+  const final = enforceTripWindow(filled, window);
+  if (pinned.adjusted + final.adjusted > 0) {
+    console.warn(
+      `[gemini:compose] clock enforcement adjusted ${pinned.adjusted + final.adjusted} stop(s)`,
+    );
+  }
+
+  return hydrateRefs(final.itinerary, refMap);
 }
 
 /** Below this a day does not read as a plan, whatever the model returned. */
 const TARGET_STOPS_PER_DAY = 6;
+
+export type TripWindow = {
+  dates: string[];
+  /** When they leave home, and the date that happens on. */
+  departTime: string;
+  departDate: string;
+  /** Earliest anything at the destination can start, and its date. */
+  arrivalTime: string;
+  arrivalDate: string;
+  /** When they must leave the destination to get home on time, and its date. */
+  latestDepartureTime: string;
+  latestDepartureDate: string;
+  /** When they must be home. */
+  returnTime: string;
+};
+
+/**
+ * THE CLOCK IS NOT NEGOTIABLE.
+ *
+ * departAt and returnBy are the two things a traveller cannot flex — everything
+ * else in the plan is a suggestion, but being home late is a broken promise.
+ * The prompt states both as hard constraints and the model mostly respects
+ * them, but "mostly" is not a guarantee, so this enforces them in code:
+ *
+ *   - Day 1 gets a depart stop at exactly their stated departure time.
+ *   - Nothing at the destination may start before they physically arrive.
+ *   - Nothing on the final day may run past the latest departure that still
+ *     gets them home by returnBy.
+ *   - The final day ends with the drive home, landing exactly on returnBy.
+ *
+ * A stop that cannot fit inside that window is shortened if there is room and
+ * dropped if there is not. Dropping a stop is a worse plan; running past the
+ * return time is a wrong one.
+ */
+function enforceTripWindow(
+  itinerary: Itinerary,
+  w: TripWindow,
+): { itinerary: Itinerary; adjusted: number } {
+  let adjusted = 0;
+  const lastDate = w.dates[w.dates.length - 1];
+
+  const days = itinerary.days.map((day) => {
+    // Multi-day drives can land the arrival on a later date than departure, so
+    // the floor and ceiling attach to the DATE they actually fall on.
+    const floor = day.date === w.arrivalDate ? w.arrivalTime : "05:00";
+    const ceiling =
+      day.date === w.latestDepartureDate ? w.latestDepartureTime : "23:30";
+
+    const existingDepart = day.stops.find((s) => s.kind === "depart");
+    const existingHome = day.stops.find((s) => s.kind === "drive_home");
+    const body = day.stops.filter((s) => !TRAVEL_KINDS.has(s.kind));
+
+    // Re-flow the day inside its window. Order is already correct by this
+    // point; this only pins it to the real clock.
+    const kept: ItineraryStop[] = [];
+    let prevEnd = floor;
+    for (const stop of body) {
+      const duration = Math.max(15, minutesBetween(stop.startTime, stop.endTime) || 60);
+      const start = stop.startTime < prevEnd ? prevEnd : stop.startTime;
+      if (start >= ceiling) {
+        adjusted++;
+        continue; // The window has closed; this cannot happen today.
+      }
+      let end = addMinutes(start, duration);
+      if (end > ceiling) {
+        // Shorten rather than drop, but only if what remains is still a visit.
+        if (minutesBetween(start, ceiling) < 20) {
+          adjusted++;
+          continue;
+        }
+        end = ceiling;
+      }
+      if (start !== stop.startTime || end !== stop.endTime) adjusted++;
+      kept.push({ ...stop, startTime: start, endTime: end });
+      prevEnd = end;
+    }
+
+    const stops: ItineraryStop[] = [];
+
+    if (day.date === w.departDate) {
+      stops.push({
+        ...(existingDepart ?? {
+          placeId: "origin",
+          name: "Leave home",
+          kind: "depart" as const,
+          famousFor: "The drive out.",
+          why: "Timed to the departure you gave us.",
+          isHighlight: false,
+          optional: false,
+        }),
+        placeId: "origin",
+        kind: "depart",
+        startTime: w.departTime,
+        endTime: w.arrivalDate === w.departDate ? w.arrivalTime : "23:59",
+      });
+    }
+
+    stops.push(...kept);
+
+    if (day.date === lastDate) {
+      stops.push({
+        ...(existingHome ?? {
+          placeId: "origin",
+          name: "Drive home",
+          kind: "drive_home" as const,
+          famousFor: "The road back.",
+          why: "Timed so you are home by the time you asked for.",
+          isHighlight: false,
+          optional: false,
+        }),
+        placeId: "origin",
+        kind: "drive_home",
+        startTime: w.latestDepartureTime,
+        endTime: w.returnTime,
+      });
+    }
+
+    return { ...day, stops };
+  });
+
+  const check = itinerarySchema.safeParse({ ...itinerary, days });
+  if (!check.success) return { itinerary, adjusted: 0 };
+  return { itinerary: check.data, adjusted };
+}
 
 /** Which pool categories can legitimately serve each stop kind. */
 const KIND_SOURCES: Record<string, string[]> = {
@@ -340,6 +496,66 @@ const KIND_TARGET_TIME: Record<string, string> = {
 };
 
 const EXPERIENCE_KINDS = new Set(["sight", "outdoor", "activity", "viewpoint"]);
+
+/** What each slot is actually for, in words a person would use. */
+const SLOT_LABEL: Record<string, string> = {
+  breakfast: "breakfast", lunch: "lunch", dinner: "dinner",
+  coffee: "a coffee break", dessert: "something sweet",
+  sight: "the day's sightseeing", outdoor: "time outdoors",
+  activity: "an afternoon activity", viewpoint: "golden hour",
+  shopping: "a wander through the shops", evening: "the evening",
+};
+
+/** "hiking_area" -> "hiking area". The most specific true label Google gives us. */
+function humanType(place: EnrichedPlace): string {
+  const raw = place.primaryType || place.types?.[0] || place.category;
+  return raw.replace(/_/g, " ").toLowerCase();
+}
+
+function tidy(text: string | undefined, max = 400): string | undefined {
+  if (!text) return undefined;
+  const t = text.replace(/\s+/g, " ").trim();
+  if (t.length < 15) return undefined;
+  return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t;
+}
+
+/**
+ * Prose for a backfilled stop, built ONLY from what Google actually says about
+ * the place.
+ *
+ * "4.7/5 from 9,675 ratings" is not a reason to go anywhere — nobody picks a
+ * waterfall off its rating, and the UI never shows one. So famousFor and why
+ * each take a DIFFERENT real source, so they say two things rather than
+ * restating one. When a place has no written description at all, the fallback
+ * says plainly what it is and which part of the day it is filling, rather than
+ * inventing a reputation for it.
+ */
+function describeBackfill(
+  place: EnrichedPlace,
+  kind: string,
+): { famousFor: string; why: string } {
+  const editorial = tidy(place.editorialSummary);
+  const summary = tidy(place.reviewSummary);
+  const type = humanType(place);
+
+  const famousFor = editorial ?? summary ?? `A ${type} in the area.`;
+  // Whichever written source famousFor did not already use.
+  const spare = famousFor === editorial ? summary : undefined;
+
+  // Real visitor commentary, labelled as such. Long reviews carry detail;
+  // "Nice place!" carries none, so short ones are skipped.
+  const reviewLine = (place.reviews ?? [])
+    .map((r) => tidy(sanitizeReview(r), 220))
+    .filter((r): r is string => r !== undefined && r.length >= 40)
+    .sort((a, b) => b.length - a.length)[0];
+
+  const why =
+    spare ??
+    (reviewLine ? `What visitors single out: ${reviewLine}` : undefined) ??
+    `A ${type} close to the day's other stops, picked for ${SLOT_LABEL[kind] ?? "this part of the day"}.`;
+
+  return { famousFor, why };
+}
 
 /**
  * GUARANTEED-OUTPUT LAYER.
@@ -426,10 +642,7 @@ function backfillThinDays(
       used.add(ref);
       added++;
 
-      const rated =
-        place.rating && place.ratingCount
-          ? `${place.rating}/5 from ${place.ratingCount} ratings`
-          : "not widely rated yet";
+      const { famousFor, why } = describeBackfill(place, kind);
 
       additions.push({
         placeId: ref,
@@ -437,11 +650,8 @@ function backfillThinDays(
         kind: kind as ItineraryStop["kind"],
         startTime: start,
         endTime: start,
-        famousFor:
-          place.editorialSummary ||
-          place.reviewSummary ||
-          `A well-regarded ${place.category} option in the area.`,
-        why: `Added to round out the day — ${rated}.`,
+        famousFor,
+        why,
         isHighlight: false,
         optional: false,
         ...(place.sparseData ? { headsUp: "Few ratings, so this one is less of a sure thing." } : {}),
@@ -530,6 +740,7 @@ function verifyItinerary(
   validIds: Set<string>,
   dates: string[],
   foodFocused = false,
+  window?: TripWindow,
 ): { hard: string[]; soft: string[] } {
   // HARD  — the itinerary is wrong and must never be shown: invented places,
   //         dates outside the trip, impossible times.
@@ -642,8 +853,30 @@ function verifyItinerary(
     seen.add(stop.placeId);
   }
 
+  // The clock. SOFT rather than hard on purpose: enforceTripWindow guarantees
+  // these in code afterwards, so a violation is worth one corrective retry —
+  // the model writes a better day than the clamp does — but never worth
+  // failing the request over.
+  if (window) {
+    for (const day of v.days) {
+      for (const stop of day.stops) {
+        if (TRAVEL_KINDS.has(stop.kind)) continue;
+        if (day.date === window.arrivalDate && stop.startTime < window.arrivalTime) {
+          soft.push(
+            `"${stop.name}" starts at ${stop.startTime} on ${day.date}, but they do not arrive until ${window.arrivalTime}. Nothing can happen before they get there.`,
+          );
+        }
+        if (day.date === window.latestDepartureDate && stop.endTime > window.latestDepartureTime) {
+          soft.push(
+            `"${stop.name}" runs to ${stop.endTime}, past the ${window.latestDepartureTime} they must leave by to be home at ${window.returnTime}. Move it earlier or drop it.`,
+          );
+        }
+      }
+    }
+  }
+
   return { hard: issues, soft };
 }
 
-export { verifyItinerary, backfillThinDays };
+export { verifyItinerary, backfillThinDays, enforceTripWindow };
 export const COMPOSE_LIMITS = { maxReviews: LIMITS.MAX_REVIEWS_PER_PLACE };
