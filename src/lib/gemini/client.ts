@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, type ThinkingLevel } from "@google/genai";
 import type { z } from "zod";
 import type { Budget } from "../budget";
 import { BUDGET, env } from "../config";
@@ -7,11 +7,20 @@ import { toGeminiSchema } from "../schema/itinerary";
 
 let client: GoogleGenAI | null = null;
 
+/** Models that rejected the configured thinking level; remembered per instance. */
+const thinkingUnsupported = new Set<string>();
+
 /** Compose may run on a stronger model than the cheaper upstream stages. */
 function modelForStage(stage: string): string {
   const e = env();
   if (stage === "compose" && e.GEMINI_MODEL_COMPOSE) return e.GEMINI_MODEL_COMPOSE;
   return e.GEMINI_MODEL;
+}
+
+function thinkingForStage(stage: string): { thinkingLevel: ThinkingLevel } | undefined {
+  const e = env();
+  const level = stage === "compose" && e.GEMINI_THINKING_COMPOSE ? e.GEMINI_THINKING_COMPOSE : e.GEMINI_THINKING;
+  return level === "default" ? undefined : { thinkingLevel: level as ThinkingLevel };
 }
 
 function ai(): GoogleGenAI {
@@ -68,30 +77,61 @@ export async function generateStructured<T>(opts: GenerateOptions<T>): Promise<T
 
   let currentPrompt = prompt;
   let lastIssues: string[] = [];
+  // Survives across attempts: a later repair can come back worse, and an
+  // imperfect earlier draft beats an error when time runs out.
+  let softFallback: T | null = null;
 
   for (;;) {
     budget.chargeGemini(stage);
 
     let raw: string;
+    const model = modelForStage(stage);
+    const thinkingConfig = thinkingForStage(stage);
+    const t0 = Date.now();
     try {
-      raw = await callWithTransientRetry(() =>
-        ai().models.generateContent({
-          model: modelForStage(stage),
-          contents: currentPrompt,
-          config: {
-            systemInstruction: system,
-            responseMimeType: "application/json",
-            responseSchema,
-            temperature: opts.temperature ?? 0.7,
-            maxOutputTokens: BUDGET.MAX_OUTPUT_TOKENS,
-          },
-        }),
-      );
+      raw = await callWithTransientRetry(async () => {
+        const request = (withThinking: boolean) =>
+          ai().models.generateContent({
+            model,
+            contents: currentPrompt,
+            config: {
+              systemInstruction: system,
+              responseMimeType: "application/json",
+              responseSchema,
+              temperature: opts.temperature ?? 0.7,
+              maxOutputTokens: BUDGET.MAX_OUTPUT_TOKENS,
+              ...(withThinking && thinkingConfig ? { thinkingConfig } : {}),
+            },
+          });
+        let usedThinking = Boolean(thinkingConfig) && !thinkingUnsupported.has(model);
+        let res;
+        try {
+          res = await request(usedThinking);
+        } catch (e) {
+          // Not every model accepts every level (3.8-flash rejects MINIMAL).
+          // Fall back to the model default rather than failing the trip.
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!usedThinking || !/thinking/i.test(msg) || !/not supported|invalid/i.test(msg)) throw e;
+          console.warn(`[gemini:${stage}] ${model} rejected thinkingLevel=${thinkingConfig?.thinkingLevel}; using model default`);
+          thinkingUnsupported.add(model);
+          usedThinking = false;
+          res = await request(false);
+        }
+        const u = res.usageMetadata;
+        // One line per call: latency is the thing users feel, and this is the
+        // only place that can attribute it to a stage, model and thinking level.
+        console.info(
+          `[gemini:${stage}] ${model} thinking=${usedThinking ? thinkingConfig?.thinkingLevel : "default"} ` +
+            `${((Date.now() - t0) / 1000).toFixed(1)}s in=${u?.promptTokenCount ?? "?"} ` +
+            `thought=${u?.thoughtsTokenCount ?? 0} out=${u?.candidatesTokenCount ?? "?"}`,
+        );
+        return res;
+      });
     } catch (e) {
       throw toPlannerError(e);
     }
 
-    let softFallback: T | null = null;
+    const callMs = Date.now() - t0;
 
     if (!raw.trim()) {
       lastIssues = ["Model returned an empty response"];
@@ -104,10 +144,19 @@ export async function generateStructured<T>(opts: GenerateOptions<T>): Promise<T
       if (parsed.usable) softFallback = parsed.usable;
     }
 
-    if (!budget.consumeRepair()) {
+    console.warn(`[gemini:${stage}] rejected:`, lastIssues.slice(0, 6).join(" | ").slice(0, 600));
+
+    // DEADLINE GUARD. A repair costs about as long as the call it replaces.
+    // If it can't finish — while leaving room for the stages still to run —
+    // attempting it just turns an imperfect itinerary into a timeout error.
+    // Measured on 3.8-flash: shortlist ~12s, compose ~20-29s per call.
+    const reserveMs = stage === "compose" ? 3_000 : 35_000;
+    const repairFits = budget.remainingMs() - reserveMs > callMs * 1.2;
+
+    if (!repairFits || !budget.consumeRepair()) {
       if (softFallback) {
         console.warn(
-          `[gemini:${stage}] accepting imperfect output after exhausting repairs:`,
+          `[gemini:${stage}] accepting imperfect output (${repairFits ? "repairs exhausted" : "no time for a repair"}):`,
           lastIssues.join("; "),
         );
         return softFallback;
@@ -147,7 +196,10 @@ async function callWithTransientRetry(
       if (!transient || attempt === MAX_TRANSIENT_RETRIES) throw e;
       const waitMs = 2 ** (attempt + 1) * 1000 + Math.random() * 500;
       console.warn(
-        `[gemini] transient failure (attempt ${attempt + 1}/${MAX_TRANSIENT_RETRIES}), retrying in ${Math.round(waitMs / 1000)}s`,
+        `[gemini] transient failure (attempt ${attempt + 1}/${MAX_TRANSIENT_RETRIES}), retrying in ${Math.round(waitMs / 1000)}s:`,
+        // The reason is the whole point of the log: 429 (quota) and 503
+        // (overloaded) need opposite fixes, and the line is useless without it.
+        message.slice(0, 300),
       );
       // 2s, 4s, 8s — 503s from demand spikes usually clear in seconds.
       await new Promise((r) => setTimeout(r, waitMs));

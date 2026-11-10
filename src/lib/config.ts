@@ -24,9 +24,19 @@ const envSchema = z.object({
    * many simultaneous constraints — and it is where a small model most often
    * fails. Overriding just this stage costs one call per trip while leaving
    * the cheap stages on the light model.
-   * Falls back to GEMINI_MODEL when unset.
+   * Defaults to 3.8-flash; the upstream stages default to Flash-Lite.
    */
-  GEMINI_MODEL_COMPOSE: z.string().optional(),
+  GEMINI_MODEL_COMPOSE: z.string().default("gemini-3.8-flash"),
+
+  /**
+   * Thinking level per stage. Thinking is the dominant latency cost: on
+   * 3.x Flash the model-default level roughly doubles each call, and the
+   * three stages run back to back. GEMINI_THINKING applies to every stage;
+   * GEMINI_THINKING_COMPOSE overrides compose only. "default" leaves it to
+   * the model.
+   */
+  GEMINI_THINKING: z.enum(["default", "MINIMAL", "LOW", "MEDIUM", "HIGH"]).default("LOW"),
+  GEMINI_THINKING_COMPOSE: z.enum(["default", "MINIMAL", "LOW", "MEDIUM", "HIGH"]).optional(),
 
   // Supabase is Phase 5 and entirely optional. Blank => persistence disabled,
   // itineraries are returned inline instead of via a share link.
