@@ -1,8 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <!-- NewWeekend mark: the sun coming up over the open road. -->
+  <!-- NewWeekend monogram: one unbroken line that spells N then W.
+       Like the wordmark, the colour breaks from neutral to amber exactly
+       where "New" becomes "Weekend". -->
   <rect width="32" height="32" rx="7" fill="#0f172a"/>
-  <path d="M7 19a9 9 0 0 1 18 0z" fill="#f59e0b"/>
-  <rect x="4" y="19" width="24" height="1.6" rx="0.8" fill="#f8fafc"/>
-  <path d="M14.6 20.6h2.8L21 29h-10z" fill="#f8fafc"/>
-  <path d="M15.6 22h0.8v2.2h-0.8zM15.4 25.6h1.2v2.4h-1.2z" fill="#0f172a"/>
+  <g fill="none" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5 22V10l7 12V10" stroke="#f8fafc"/>
+    <path d="M12 10l3.6 12 3.9-9 3.9 9L27 10" stroke="#f59e0b"/>
+  </g>
 </svg>
